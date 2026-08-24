@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Blender backup files
+*.blend1
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and debug outputs
+**/debug_discarded/
+
+# Logs
+*.log
+
+# Deployment artifacts
+*.engine
+
+# Archives / temporary packages
+*.tar
+*.tar.gz
+*.zip

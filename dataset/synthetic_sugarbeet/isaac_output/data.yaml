@@ -1,6 +1,0 @@
-path: /isaac_output
-train: images/train
-val: images/val
-names:
-  0: crop
-  1: weed
