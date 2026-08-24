@@ -12,4 +12,4 @@
 
 The project follows the workflow:
 
-3D asset preparation → Isaac Sim synthetic data generation → dataset preparation → RT-DETR training → evaluation → deployment
+3D asset preparation -> Isaac Sim synthetic data generation -> dataset preparation -> RT-DETR training -> evaluation -> deployment
