@@ -43,13 +43,13 @@ train:
   gpu_ids: [0]
   num_nodes: 1
   seed: 1337
-  precision: fp16
+  precision: bf16
   activation_checkpoint: true
 
   optim:
     optimizer: AdamW
-    lr: 0.0002
-    lr_backbone: 0.00002
+    lr: 0.00005
+    lr_backbone: 0.000005
     momentum: 0.9
     weight_decay: 0.0001
     lr_scheduler: MultiStep

@@ -1,0 +1,70 @@
+results_dir: /workspace/results/real
+
+dataset:
+  train_data_sources:
+    - image_dir: /workspace/data/real/images
+      json_file: /workspace/data/real/annotations/real_train_full.json
+
+  val_data_sources:
+    image_dir: /workspace/data/real/images
+    json_file: /workspace/data/real/annotations/real_val.json
+
+  test_data_sources:
+    image_dir: /workspace/data/real/images
+    json_file: /workspace/data/real/annotations/real_test.json
+
+  num_classes: 3
+  eval_class_ids: [1, 2]
+  batch_size: 4
+  workers: 1
+  remap_mscoco_category: false
+  pin_memory: true
+  dataset_type: serialized
+
+  augmentation:
+    train_spatial_size: [544, 960]
+    eval_spatial_size: [544, 960]
+    preserve_aspect_ratio: false
+
+model:
+  backbone: resnet_50
+  train_backbone: true
+  pretrained_backbone_path: /workspace/weights/resnet50-0676ba61.pth
+  num_queries: 300
+  num_select: 300
+  return_interm_indices: [1, 2, 3]
+  dec_layers: 6
+  enc_layers: 1
+
+train:
+  num_epochs: 160
+  checkpoint_interval: 5
+  validation_interval: 5
+
+  num_gpus: 1
+  gpu_ids: [0]
+  num_nodes: 1
+  seed: 1337
+  precision: bf16
+  activation_checkpoint: true
+
+  optim:
+    optimizer: AdamW
+    lr: 0.00005
+    lr_backbone: 0.000005
+    momentum: 0.9
+    weight_decay: 0.0001
+    lr_scheduler: MultiStep
+    lr_steps: [80, 110]
+    lr_decay: 0.1
+
+evaluate:
+  conf_threshold: 0.0
+
+export:
+  input_channel: 3
+  input_width: 960
+  input_height: 544
+  batch_size: 1
+  opset_version: 17
+  on_cpu: false
