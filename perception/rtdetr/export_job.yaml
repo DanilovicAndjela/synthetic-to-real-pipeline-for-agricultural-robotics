@@ -1,0 +1,111 @@
+workerPoolSpecs:
+  - machineSpec:
+      machineType: g4-standard-48
+      acceleratorType: NVIDIA_RTX_PRO_6000
+      acceleratorCount: 1
+
+    replicaCount: 1
+
+    containerSpec:
+      imageUri: europe-west4-docker.pkg.dev/konsulko-gpu-train/training/trainer:latest
+
+      command:
+        - /bin/bash
+        - -lc
+
+      args:
+        - |
+          set -euo pipefail
+
+          mkdir -p /workspace/export
+          mkdir -p /workspace/weights
+
+          echo "Downloading checkpoint..."
+
+          python - <<'PY'
+          from google.cloud import storage
+
+          bucket = "konsulko-gpu-train-staging"
+          blob = "runs/real_n337/checkpoints/model_epoch_134.pth"
+          target = "/workspace/weights/model_epoch_134.pth"
+
+          client = storage.Client()
+          client.bucket(bucket).blob(blob).download_to_filename(target)
+
+          print("Downloaded:", target)
+          PY
+
+          echo "Exporting RT-DETR to ONNX..."
+
+          rtdetr export \
+            -e /workspace/specs/rtdetr_real.yaml \
+            export.checkpoint=/workspace/weights/model_epoch_134.pth \
+            export.onnx_file=/workspace/export/rtdetr_C337_epoch134.onnx \
+            export.input_channel=3 \
+            export.input_width=960 \
+            export.input_height=544 \
+            export.batch_size=1 \
+            export.opset_version=17 \
+            export.on_cpu=False
+
+          echo "Validating and uploading ONNX..."
+
+          python - <<'PY'
+          import onnx
+          from google.cloud import storage
+
+          path = "/workspace/export/rtdetr_C337_epoch134.onnx"
+
+          model = onnx.load(path)
+          onnx.checker.check_model(model)
+
+          print("ONNX CHECK: PASS")
+
+          print(
+              "Inputs:",
+              [
+                  (
+                      i.name,
+                      [
+                          d.dim_value or d.dim_param
+                          for d in i.type.tensor_type.shape.dim
+                      ],
+                  )
+                  for i in model.graph.input
+              ],
+          )
+
+          print(
+              "Outputs:",
+              [
+                  (
+                      o.name,
+                      [
+                          d.dim_value or d.dim_param
+                          for d in o.type.tensor_type.shape.dim
+                      ],
+                  )
+                  for o in model.graph.output
+              ],
+          )
+
+          bucket = "konsulko-gpu-train-staging"
+          blob = "runs/real_n337/export/rtdetr_C337_epoch134.onnx"
+
+          client = storage.Client()
+          client.bucket(bucket).blob(blob).upload_from_filename(path)
+
+          print(
+              "Uploaded:",
+              f"gs://{bucket}/{blob}"
+          )
+          PY
+
+          echo "EXPORT COMPLETED"
+
+scheduling:
+  strategy: SPOT
+  timeout: 3600s
+  restartJobOnWorkerRestart: false
+
+serviceAccount: trainer@konsulko-gpu-train.iam.gserviceaccount.com
