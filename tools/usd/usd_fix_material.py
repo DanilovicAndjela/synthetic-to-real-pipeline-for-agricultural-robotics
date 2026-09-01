@@ -19,11 +19,11 @@ USD_EXT = (".usd", ".usda", ".usdc", ".usdz")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".bmp", ".exr", ".hdr")
 
 ROLE_KEYS = {
-    "diffuse":   ("diff", "albedo", "basecolor", "base_color", "_col", "color"),
-    "alpha":     ("alpha", "opacity", "_mask"),
+    "diffuse": ("diff", "albedo", "basecolor", "base_color", "_col", "color"),
+    "alpha": ("alpha", "opacity", "_mask"),
     "roughness": ("rough",),
-    "normal":    ("nor_gl", "normal", "_nor", "_nrm"),
-    "metallic":  ("metal",),
+    "normal": ("nor_gl", "normal", "_nor", "_nrm"),
+    "metallic": ("metal",),
 }
 
 WARN_EXR = True
@@ -215,8 +215,7 @@ def process(asset_path, tex_dir_override=None, force=False, uv_override=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", help="USD file or directory")
     ap.add_argument("--tex-dir", default=None, help="override texture directory")
     ap.add_argument("--uv-primvar", default=None, help="override UV primvar name (st, UVMap)")
