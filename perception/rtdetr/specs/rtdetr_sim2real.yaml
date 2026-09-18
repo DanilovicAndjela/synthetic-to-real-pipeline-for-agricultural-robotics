@@ -2,16 +2,16 @@ results_dir: /workspace/results/sim2real
 
 dataset:
   train_data_sources:
-    - image_dir: /workspace/data/real/images
-      json_file: /workspace/data/real/annotations/real_train_full.json
+    - image_dir: /workspace/data/real_v2/train/images
+      json_file: /workspace/data/real_v2/annotations/real_train_full.json
 
   val_data_sources:
-    image_dir: /workspace/data/real/images
-    json_file: /workspace/data/real/annotations/real_val.json
+    image_dir: /workspace/data/real_v2/val/images
+    json_file: /workspace/data/real_v2/annotations/real_val.json
 
   test_data_sources:
-    image_dir: /workspace/data/real/images
-    json_file: /workspace/data/real/annotations/real_test.json
+    image_dir: /workspace/data/real_v2/test/images
+    json_file: /workspace/data/real_v2/annotations/real_test.json
 
   num_classes: 3
   eval_class_ids: [1, 2]
@@ -36,11 +36,11 @@ model:
   enc_layers: 1
 
 train:
-  pretrained_model_path: /workspace/weights/A_model_epoch_119.pth
+  pretrained_model_path: /workspace/weights/synthetic_pretrained.pth
 
-  num_epochs: 40
-  checkpoint_interval: 5
-  validation_interval: 5
+  num_epochs: 70
+  checkpoint_interval: 2
+  validation_interval: 1
 
   num_gpus: 1
   gpu_ids: [0]
@@ -48,15 +48,19 @@ train:
   seed: 1337
   precision: bf16
   activation_checkpoint: true
+  
+  clip_grad_norm: 0.1
+
+  enable_ema: true
 
   optim:
     optimizer: AdamW
-    lr: 0.00001
-    lr_backbone: 0.000001
+    lr: 0.0002
+    lr_backbone: 0.00002
     momentum: 0.9
     weight_decay: 0.0001
     lr_scheduler: MultiStep
-    lr_steps: [25, 35]
+    lr_steps: [45, 60]
     lr_decay: 0.1
 
 evaluate:

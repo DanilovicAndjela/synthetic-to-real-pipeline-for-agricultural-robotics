@@ -1,9 +1,102 @@
 #!/usr/bin/env python3
+"""
+Generic Vertex AI runner for NVIDIA TAO RT-DETR training and evaluation.
+
+Supported experiments:
+    EXPERIMENT=synthetic
+        Train RT-DETR on the synthetic dataset.
+
+    EXPERIMENT=sim2real
+        Fine-tune the synthetic-pretrained detector on N real images from the
+        frozen real_v2 dataset.
+        Requires REAL_N and PRETRAINED_MODEL_URI for training.
+
+        Supported REAL_N values: 50, 100, 200, 512.
+
+        For REAL_N=512:
+            train = real_train_full.json
+            val   = real_val.json
+            test  = real_test.json
+
+        For REAL_N<512:
+            train = real_train_{N}.json
+            val   = real_val.json
+            test  = real_test.json
+
+    EXPERIMENT=real
+        Legacy real-only experiment using the old /workspace/data/real layout.
+        Requires REAL_N.
+
+    EXPERIMENT=real_v2
+        Final real-only C experiment using the frozen real_v2 split.
+
+        Supported REAL_N values: 50, 100, 200, 512.
+        If REAL_N is omitted, 512 is used.
+
+        For REAL_N=512:
+            train = real_train_full.json
+            val   = real_val.json
+            test  = real_test.json
+
+        For REAL_N<512:
+            train = real_train_{N}.json
+            val   = real_val.json
+            test  = real_test.json
+
+        The full NVIDIA pretrained RT-DETR checkpoint must already exist
+        inside the container at:
+            /workspace/weights/rtdetr_pretrained.pth
+
+        PRETRAINED_MODEL_URI is not used for real_v2.
+
+Required environment variables:
+    EXPERIMENT
+        synthetic | sim2real | real | real_v2
+
+    DATA_ROOT_URI
+        Root dataset URI, for example:
+        gs://konsulko-gpu-train-staging/data
+
+    AIP_CHECKPOINT_DIR
+        Required for training. Provided by Vertex AI when
+        baseOutputDirectory is configured.
+
+    AIP_MODEL_DIR
+        Required by this runner for job artifacts.
+
+Additional environment variables:
+    ACTION
+        train | evaluate. Default: train
+
+    REAL_N
+        Required for legacy real and sim2real experiments.
+        Optional for real_v2; defaults to 512.
+        Supported real_v2/sim2real values: 50, 100, 200, 512.
+
+    PRETRAINED_MODEL_URI
+        Required only for sim2real training.
+
+    CHECKPOINT_URI
+        Required for ACTION=evaluate.
+
+    SMOKE_TEST
+        Optional boolean. If true, runs 5 epochs and validates/checkpoints
+        after every epoch.
+
+Expected spec files:
+    /workspace/specs/rtdetr_synthetic.yaml
+    /workspace/specs/rtdetr_sim2real.yaml
+    /workspace/specs/rtdetr_real.yaml
+    /workspace/specs/rtdetr_real_v2.yaml
+"""
+
+import json
 import os
 import re
 import shlex
 import subprocess
 import threading
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -17,8 +110,49 @@ RESUME_DIR = WORKSPACE / "resume"
 WEIGHTS_DIR = WORKSPACE / "weights"
 SPECS_DIR = WORKSPACE / "specs"
 
-CHECKPOINT_RE = re.compile(r"model_epoch_(\d+).*\.pth$")
+RTDETR_PRETRAINED_LOCAL = WEIGHTS_DIR / "rtdetr_pretrained.pth"
+
+CHECKPOINT_RE = re.compile(r"model_epoch_(\d+).*\.pth$", re.IGNORECASE)
+SESSION_RE = re.compile(r"^([a-zA-Z]+)-(\d+)-")
 SYNC_INTERVAL_SECONDS = 5
+
+REAL_V2_EXPECTED_IMAGES = {
+    "train": 512,
+    "val": 114,
+    "test": 113,
+}
+
+REAL_V2_EXPECTED_INSTANCES = {
+    "train": 6109,
+    "val": 1245,
+    "test": 1254,
+}
+
+REAL_V2_EXPECTED_CLASSES = {
+    "train": {1: 2383, 2: 3726},
+    "val": {1: 493, 2: 752},
+    "test": {1: 499, 2: 755},
+}
+
+
+REAL_V2_SUPPORTED_TRAIN_SIZES = {50, 100, 200, 512}
+
+
+def real_v2_train_json(data_dir, real_n):
+    if real_n not in REAL_V2_SUPPORTED_TRAIN_SIZES:
+        allowed = ", ".join(
+            str(value) for value in sorted(REAL_V2_SUPPORTED_TRAIN_SIZES)
+        )
+        raise SystemExit(
+            f"Unsupported REAL_N={real_n} for real_v2. "
+            f"Allowed values: {allowed}"
+        )
+
+    if real_n == 512:
+        return data_dir / "annotations" / "real_train_full.json"
+
+    return data_dir / "annotations" / f"real_train_{real_n}.json"
+
 
 ACTION = os.environ.get("ACTION", "train").strip().lower()
 EXPERIMENT = os.environ.get("EXPERIMENT", "").strip().lower()
@@ -37,7 +171,7 @@ AIP_MODEL_DIR = os.environ.get("AIP_MODEL_DIR", "").strip()
 
 
 def banner(message):
-    print(f"\n{message}\n", flush=True)
+    print(f"\n{'=' * 72}\n{message}\n{'=' * 72}", flush=True)
 
 
 def parse_positive_int(value, name):
@@ -54,13 +188,31 @@ def parse_positive_int(value, name):
     return parsed
 
 
+def resolve_evaluation_checkpoint(config):
+    if ACTION != "evaluate":
+        return
+
+    if not CHECKPOINT_URI:
+        raise SystemExit("CHECKPOINT_URI is required for ACTION=evaluate")
+
+    if not CHECKPOINT_URI.startswith("gs://"):
+        raise SystemExit(
+            "CHECKPOINT_URI must be a gs:// URI, got: "
+            f"{CHECKPOINT_URI}"
+        )
+
+    config["evaluation_checkpoint_local"] = (
+        WEIGHTS_DIR / "evaluation_checkpoint.pth"
+    )
+
+
 def resolve_configuration():
     if ACTION not in {"train", "evaluate"}:
         raise SystemExit("ACTION must be one of: train, evaluate")
 
-    if EXPERIMENT not in {"synthetic", "sim2real", "real"}:
+    if EXPERIMENT not in {"synthetic", "sim2real", "real", "real_v2"}:
         raise SystemExit(
-            "EXPERIMENT must be one of: synthetic, sim2real, real"
+            "EXPERIMENT must be one of: synthetic, sim2real, real, real_v2"
         )
 
     if not DATA_ROOT_URI:
@@ -84,17 +236,106 @@ def resolve_configuration():
         "evaluation_checkpoint_local": None,
     }
 
+    # ------------------------------------------------------------------
+    # Synthetic experiment
+    # ------------------------------------------------------------------
     if EXPERIMENT == "synthetic":
         config.update(
             {
                 "spec": SPECS_DIR / "rtdetr_synthetic.yaml",
                 "data_uri": f"{DATA_ROOT_URI}/synth",
                 "data_dir": DATA_ROOT / "synth",
-                "results_dir": RESULTS_ROOT / ("synthetic" if ACTION == "train" else "synthetic_eval"),
+                "results_dir": RESULTS_ROOT / (
+                    "synthetic" if ACTION == "train" else "synthetic_eval"
+                ),
             }
         )
+        resolve_evaluation_checkpoint(config)
         return config
 
+    # ------------------------------------------------------------------
+    # Final real-only C experiment on frozen real_v2 split
+    # ------------------------------------------------------------------
+    if EXPERIMENT == "real_v2":
+        data_dir = DATA_ROOT / "real_v2"
+
+        real_n = (
+            parse_positive_int(REAL_N_RAW, "REAL_N")
+            if REAL_N_RAW
+            else 512
+        )
+        train_json = real_v2_train_json(data_dir, real_n)
+
+        config.update(
+            {
+                "real_n": real_n,
+                "spec": SPECS_DIR / "rtdetr_real_v2.yaml",
+                "data_uri": f"{DATA_ROOT_URI}/real_v2",
+                "data_dir": data_dir,
+                "results_dir": RESULTS_ROOT / (
+                    f"real_v2_n{real_n}"
+                    if ACTION == "train"
+                    else f"real_v2_n{real_n}_eval"
+                ),
+                "train_json": train_json,
+            }
+        )
+
+        resolve_evaluation_checkpoint(config)
+        return config
+
+    # ------------------------------------------------------------------
+    # B-seq sim2real experiment on the SAME frozen real_v2 split as C
+    # ------------------------------------------------------------------
+    if EXPERIMENT == "sim2real":
+        if not REAL_N_RAW:
+            raise SystemExit(
+                "REAL_N is required for EXPERIMENT=sim2real"
+            )
+
+        real_n = parse_positive_int(REAL_N_RAW, "REAL_N")
+        data_dir = DATA_ROOT / "real_v2"
+
+        train_json = real_v2_train_json(data_dir, real_n)
+
+        config.update(
+            {
+                "real_n": real_n,
+                "spec": SPECS_DIR / "rtdetr_sim2real.yaml",
+                "data_uri": f"{DATA_ROOT_URI}/real_v2",
+                "data_dir": data_dir,
+                "results_dir": RESULTS_ROOT / (
+                    f"sim2real_n{real_n}"
+                    if ACTION == "train"
+                    else f"sim2real_n{real_n}_eval"
+                ),
+                "train_json": train_json,
+            }
+        )
+
+        if ACTION == "train":
+            if not PRETRAINED_MODEL_URI:
+                raise SystemExit(
+                    "PRETRAINED_MODEL_URI is required for "
+                    "EXPERIMENT=sim2real"
+                )
+
+            if not PRETRAINED_MODEL_URI.startswith("gs://"):
+                raise SystemExit(
+                    "PRETRAINED_MODEL_URI must be a gs:// URI, got: "
+                    f"{PRETRAINED_MODEL_URI}"
+                )
+
+            config["pretrained_model_local"] = (
+                WEIGHTS_DIR / "synthetic_pretrained.pth"
+            )
+
+        resolve_evaluation_checkpoint(config)
+        return config
+
+    # ------------------------------------------------------------------
+    # Legacy real-only path
+    # ------------------------------------------------------------------
     if not REAL_N_RAW:
         raise SystemExit(
             f"REAL_N is required for EXPERIMENT={EXPERIMENT}"
@@ -107,9 +348,7 @@ def resolve_configuration():
         train_json = data_dir / "annotations" / "real_train_full.json"
     else:
         train_json = (
-            data_dir
-            / "annotations"
-            / f"real_train_n{real_n}.json"
+            data_dir / "annotations" / f"real_train_n{real_n}.json"
         )
 
     config.update(
@@ -127,38 +366,7 @@ def resolve_configuration():
         }
     )
 
-    if ACTION == "train" and EXPERIMENT == "sim2real":
-        if not PRETRAINED_MODEL_URI:
-            raise SystemExit(
-                "PRETRAINED_MODEL_URI is required for EXPERIMENT=sim2real"
-            )
-
-        if not PRETRAINED_MODEL_URI.startswith("gs://"):
-            raise SystemExit(
-                "PRETRAINED_MODEL_URI must be a gs:// URI, got: "
-                f"{PRETRAINED_MODEL_URI}"
-            )
-
-        config["pretrained_model_local"] = (
-            WEIGHTS_DIR / "synthetic_pretrained.pth"
-        )
-
-    if ACTION == "evaluate":
-        if not CHECKPOINT_URI:
-            raise SystemExit(
-                "CHECKPOINT_URI is required for ACTION=evaluate"
-            )
-
-        if not CHECKPOINT_URI.startswith("gs://"):
-            raise SystemExit(
-                "CHECKPOINT_URI must be a gs:// URI, got: "
-                f"{CHECKPOINT_URI}"
-            )
-
-        config["evaluation_checkpoint_local"] = (
-            WEIGHTS_DIR / "evaluation_checkpoint.pth"
-        )
-
+    resolve_evaluation_checkpoint(config)
     return config
 
 
@@ -187,14 +395,17 @@ def require_environment():
         "SPEC": SPEC,
         "RESULTS_DIR": RESULTS_DIR,
         "TRAIN_JSON": TRAIN_JSON,
+        "RTDETR_PRETRAINED_LOCAL": (
+            RTDETR_PRETRAINED_LOCAL
+            if ACTION == "train" and EXPERIMENT == "real_v2"
+            else None
+        ),
         "PRETRAINED_MODEL_URI": (
             PRETRAINED_MODEL_URI
             if ACTION == "train" and EXPERIMENT == "sim2real"
             else None
         ),
-        "CHECKPOINT_URI": (
-            CHECKPOINT_URI if ACTION == "evaluate" else None
-        ),
+        "CHECKPOINT_URI": CHECKPOINT_URI if ACTION == "evaluate" else None,
         "AIP_CHECKPOINT_DIR": (
             AIP_CHECKPOINT_DIR if ACTION == "train" else None
         ),
@@ -215,8 +426,7 @@ def require_environment():
 
     if missing:
         raise SystemExit(
-            "Missing required environment variables: "
-            + ", ".join(missing)
+            "Missing required environment variables: " + ", ".join(missing)
         )
 
     uris = [AIP_MODEL_DIR]
@@ -229,6 +439,26 @@ def require_environment():
 
     if not SPEC.exists():
         raise SystemExit(f"RT-DETR spec not found in container: {SPEC}")
+
+    if ACTION == "train" and EXPERIMENT == "real_v2":
+        if not RTDETR_PRETRAINED_LOCAL.is_file():
+            raise SystemExit(
+                "Full pretrained RT-DETR checkpoint not found: "
+                f"{RTDETR_PRETRAINED_LOCAL}"
+            )
+
+        size_mb = RTDETR_PRETRAINED_LOCAL.stat().st_size / 1024**2
+        if size_mb <= 0:
+            raise SystemExit(
+                "Full pretrained RT-DETR checkpoint is empty: "
+                f"{RTDETR_PRETRAINED_LOCAL}"
+            )
+
+        print(
+            "embedded RT-DETR checkpoint: "
+            f"{RTDETR_PRETRAINED_LOCAL} ({size_mb:.1f} MiB)",
+            flush=True,
+        )
 
 
 def probe_gpu():
@@ -281,20 +511,13 @@ def download_gcs_prefix(uri, local_root):
     client = storage.Client()
     query_prefix = f"{prefix}/" if prefix else ""
 
-    blobs = list(
-        client.list_blobs(
-            bucket_name,
-            prefix=query_prefix,
-        )
-    )
-
+    blobs = list(client.list_blobs(bucket_name, prefix=query_prefix))
     files = [blob for blob in blobs if not blob.name.endswith("/")]
 
     if not files:
         raise SystemExit(f"No files found under {uri}")
 
     local_root.mkdir(parents=True, exist_ok=True)
-
     total_bytes = 0
 
     for index, blob in enumerate(files, start=1):
@@ -308,15 +531,11 @@ def download_gcs_prefix(uri, local_root):
             total_bytes += blob.size
 
         if index % 100 == 0 or index == len(files):
-            print(
-                f"downloaded {index}/{len(files)} files",
-                flush=True,
-            )
+            print(f"downloaded {index}/{len(files)} files", flush=True)
 
     print(
         "dataset download complete: "
-        f"{len(files)} files, "
-        f"{total_bytes / 1024**3:.2f} GiB",
+        f"{len(files)} files, {total_bytes / 1024**3:.2f} GiB",
         flush=True,
     )
 
@@ -344,6 +563,316 @@ def download_gcs_file(uri, local_path):
     blob.download_to_filename(str(local_path))
 
 
+def session_of_filename(filename):
+    stem = Path(filename).stem
+    match = SESSION_RE.match(stem)
+
+    if not match:
+        raise SystemExit(
+            "Cannot extract session ID from real_v2 filename: "
+            f"{filename}"
+        )
+
+    return f"{match.group(1).lower()}-{match.group(2)}"
+
+
+def validate_real_v2_coco(split, json_path, images_dir):
+    try:
+        with json_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Failed to read COCO JSON {json_path}: {exc}")
+
+    images = data.get("images")
+    annotations = data.get("annotations")
+    categories = data.get("categories")
+
+    if not isinstance(images, list):
+        raise SystemExit(f"{json_path}: missing/invalid 'images' list")
+    if not isinstance(annotations, list):
+        raise SystemExit(f"{json_path}: missing/invalid 'annotations' list")
+    if not isinstance(categories, list):
+        raise SystemExit(f"{json_path}: missing/invalid 'categories' list")
+
+    expected_images = REAL_V2_EXPECTED_IMAGES[split]
+    expected_instances = REAL_V2_EXPECTED_INSTANCES[split]
+    expected_classes = REAL_V2_EXPECTED_CLASSES[split]
+
+    if len(images) != expected_images:
+        raise SystemExit(
+            f"{split}: expected {expected_images} COCO images, "
+            f"found {len(images)}"
+        )
+
+    if len(annotations) != expected_instances:
+        raise SystemExit(
+            f"{split}: expected {expected_instances} annotations, "
+            f"found {len(annotations)}"
+        )
+
+    category_map = {
+        int(category["id"]): category["name"]
+        for category in categories
+        if "id" in category and "name" in category
+    }
+
+    if category_map != {1: "crop", 2: "weed"}:
+        raise SystemExit(
+            f"{split}: unexpected categories: {category_map}"
+        )
+
+    image_ids = {image["id"] for image in images}
+    if len(image_ids) != len(images):
+        raise SystemExit(f"{split}: duplicate COCO image IDs detected")
+
+    annotation_image_ids = {
+        annotation["image_id"] for annotation in annotations
+    }
+    orphan_ids = annotation_image_ids - image_ids
+
+    if orphan_ids:
+        raise SystemExit(
+            f"{split}: orphan annotation image IDs: "
+            f"{sorted(orphan_ids)[:10]}"
+        )
+
+    class_counts = Counter(
+        int(annotation["category_id"]) for annotation in annotations
+    )
+
+    if dict(class_counts) != expected_classes:
+        raise SystemExit(
+            f"{split}: unexpected class counts. "
+            f"Expected {expected_classes}, found {dict(class_counts)}"
+        )
+
+    json_filenames = {image["file_name"] for image in images}
+    if len(json_filenames) != len(images):
+        raise SystemExit(
+            f"{split}: duplicate image filenames in COCO JSON"
+        )
+
+    disk_filenames = {
+        path.name for path in images_dir.iterdir() if path.is_file()
+    }
+
+    if json_filenames != disk_filenames:
+        missing_on_disk = sorted(json_filenames - disk_filenames)[:10]
+        extra_on_disk = sorted(disk_filenames - json_filenames)[:10]
+        raise SystemExit(
+            f"{split}: JSON/image-directory mismatch. "
+            f"Missing on disk={missing_on_disk}, extra on disk={extra_on_disk}"
+        )
+
+    sessions = {session_of_filename(name) for name in json_filenames}
+
+    print(
+        f"{split:5s}: images={len(images)} "
+        f"instances={len(annotations)} "
+        f"crop={class_counts[1]} weed={class_counts[2]} "
+        f"sessions={len(sessions)}",
+        flush=True,
+    )
+
+    return sessions
+
+
+def validate_real_v2_dataset():
+    required = [
+        DATA_DIR / "train/images",
+        DATA_DIR / "val/images",
+        DATA_DIR / "test/images",
+        DATA_DIR / "annotations/real_train_full.json",
+        DATA_DIR / "annotations/real_val.json",
+        DATA_DIR / "annotations/real_test.json",
+    ]
+
+    for path in required:
+        if not path.exists():
+            raise SystemExit(
+                f"Required real_v2 dataset path missing: {path}"
+            )
+        print(f"OK: {path}", flush=True)
+
+    split_info = {
+        "train": (
+            DATA_DIR / "annotations/real_train_full.json",
+            DATA_DIR / "train/images",
+        ),
+        "val": (
+            DATA_DIR / "annotations/real_val.json",
+            DATA_DIR / "val/images",
+        ),
+        "test": (
+            DATA_DIR / "annotations/real_test.json",
+            DATA_DIR / "test/images",
+        ),
+    }
+
+    sessions = {}
+    for split, (json_path, images_dir) in split_info.items():
+        sessions[split] = validate_real_v2_coco(
+            split, json_path, images_dir
+        )
+
+    intersections = {
+        "train/val": sessions["train"] & sessions["val"],
+        "train/test": sessions["train"] & sessions["test"],
+        "val/test": sessions["val"] & sessions["test"],
+    }
+
+    leaked = {
+        name: sorted(values)
+        for name, values in intersections.items()
+        if values
+    }
+
+    if leaked:
+        raise SystemExit(f"real_v2 session leakage detected: {leaked}")
+
+    print("real_v2 session leakage: NONE", flush=True)
+    print(
+        "real_v2 totals: "
+        f"images={sum(REAL_V2_EXPECTED_IMAGES.values())} "
+        f"instances={sum(REAL_V2_EXPECTED_INSTANCES.values())}",
+        flush=True,
+    )
+
+
+def validate_real_v2_subset():
+    """
+    Validate a reduced real_v2 training subset (REAL_N < 512).
+
+    Used by both sim2real (B) and real_v2 (C). Val/test remain the frozen
+    real_v2 splits. The image directory is still the full train/images
+    directory, so all subset references must exist on disk.
+    """
+    required = [
+        DATA_DIR / "train/images",
+        DATA_DIR / "val/images",
+        DATA_DIR / "test/images",
+        TRAIN_JSON,
+        DATA_DIR / "annotations/real_val.json",
+        DATA_DIR / "annotations/real_test.json",
+    ]
+
+    for path in required:
+        if not path.exists():
+            raise SystemExit(
+                f"Required real_v2 subset path missing: {path}"
+            )
+        print(f"OK: {path}", flush=True)
+
+    try:
+        with TRAIN_JSON.open("r", encoding="utf-8") as f:
+            train_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"Failed to read training subset COCO JSON {TRAIN_JSON}: {exc}"
+        )
+
+    images = train_data.get("images")
+    annotations = train_data.get("annotations")
+    categories = train_data.get("categories")
+
+    if not isinstance(images, list):
+        raise SystemExit(f"{TRAIN_JSON}: missing/invalid 'images' list")
+    if not isinstance(annotations, list):
+        raise SystemExit(f"{TRAIN_JSON}: missing/invalid 'annotations' list")
+    if not isinstance(categories, list):
+        raise SystemExit(f"{TRAIN_JSON}: missing/invalid 'categories' list")
+
+    if len(images) != REAL_N:
+        raise SystemExit(
+            f"real_v2 subset: expected REAL_N={REAL_N} images, "
+            f"found {len(images)}"
+        )
+
+    category_map = {
+        int(category["id"]): category["name"]
+        for category in categories
+        if "id" in category and "name" in category
+    }
+
+    if category_map != {1: "crop", 2: "weed"}:
+        raise SystemExit(
+            f"real_v2 subset: unexpected categories: {category_map}"
+        )
+
+    image_ids = {image["id"] for image in images}
+    if len(image_ids) != len(images):
+        raise SystemExit(
+            "real_v2 subset: duplicate COCO image IDs detected"
+        )
+
+    annotation_image_ids = {
+        annotation["image_id"] for annotation in annotations
+    }
+    orphan_ids = annotation_image_ids - image_ids
+
+    if orphan_ids:
+        raise SystemExit(
+            "real_v2 subset: orphan annotation image IDs: "
+            f"{sorted(orphan_ids)[:10]}"
+        )
+
+    train_dir = DATA_DIR / "train/images"
+    missing_images = [
+        image["file_name"]
+        for image in images
+        if not (train_dir / image["file_name"]).is_file()
+    ]
+
+    if missing_images:
+        raise SystemExit(
+            "real_v2 subset: referenced images missing on disk: "
+            f"{missing_images[:10]}"
+        )
+
+    class_counts = Counter(
+        int(annotation["category_id"]) for annotation in annotations
+    )
+
+    print(
+        f"train subset: images={len(images)} "
+        f"instances={len(annotations)} "
+        f"crop={class_counts[1]} weed={class_counts[2]}",
+        flush=True,
+    )
+
+    # Validate the frozen real_v2 val/test sets exactly.
+    val_sessions = validate_real_v2_coco(
+        "val",
+        DATA_DIR / "annotations/real_val.json",
+        DATA_DIR / "val/images",
+    )
+    test_sessions = validate_real_v2_coco(
+        "test",
+        DATA_DIR / "annotations/real_test.json",
+        DATA_DIR / "test/images",
+    )
+
+    # Check that the subset itself does not leak into val/test by session.
+    subset_sessions = {
+        session_of_filename(image["file_name"]) for image in images
+    }
+
+    leaked = {
+        "train/val": sorted(subset_sessions & val_sessions),
+        "train/test": sorted(subset_sessions & test_sessions),
+        "val/test": sorted(val_sessions & test_sessions),
+    }
+
+    leaked = {name: values for name, values in leaked.items() if values}
+
+    if leaked:
+        raise SystemExit(
+            f"real_v2 subset session leakage detected: {leaked}"
+        )
+
+    print("real_v2 subset session leakage: NONE", flush=True)
+
+
 def validate_dataset_layout():
     banner("DATASET SANITY CHECK")
 
@@ -360,7 +889,6 @@ def validate_dataset_layout():
                 raise SystemExit(
                     f"Required synthetic dataset path missing: {path}"
                 )
-
             print(f"OK: {path}", flush=True)
 
         train_images = sum(
@@ -368,7 +896,6 @@ def validate_dataset_layout():
             for path in (DATA_DIR / "images/train").iterdir()
             if path.is_file()
         )
-
         val_images = sum(
             1
             for path in (DATA_DIR / "images/val").iterdir()
@@ -382,9 +909,16 @@ def validate_dataset_layout():
             raise SystemExit(
                 "Synthetic train/val image directories are empty"
             )
-
         return
 
+    if EXPERIMENT in {"real_v2", "sim2real"}:
+        if REAL_N == 512:
+            validate_real_v2_dataset()
+        else:
+            validate_real_v2_subset()
+        return
+
+    # Legacy real layout.
     required = [
         DATA_DIR / "images",
         TRAIN_JSON,
@@ -394,16 +928,11 @@ def validate_dataset_layout():
 
     for path in required:
         if not path.exists():
-            raise SystemExit(
-                f"Required real dataset path missing: {path}"
-            )
-
+            raise SystemExit(f"Required real dataset path missing: {path}")
         print(f"OK: {path}", flush=True)
 
     image_count = sum(
-        1
-        for path in (DATA_DIR / "images").iterdir()
-        if path.is_file()
+        1 for path in (DATA_DIR / "images").iterdir() if path.is_file()
     )
 
     print(f"real images : {image_count}", flush=True)
@@ -414,6 +943,12 @@ def validate_dataset_layout():
 
 
 def prepare_pretrained_model():
+    """
+    Only sim2real downloads a task-specific pretrained checkpoint at runtime.
+
+    real_v2 uses the generic full RT-DETR checkpoint embedded in the
+    container image at RTDETR_PRETRAINED_LOCAL.
+    """
     if not (ACTION == "train" and EXPERIMENT == "sim2real"):
         return
 
@@ -449,29 +984,59 @@ def prepare_evaluation_checkpoint():
 
 def checkpoint_epoch(name):
     match = CHECKPOINT_RE.search(Path(name).name)
-
     if not match:
         return -1
-
     return int(match.group(1))
 
 
-def remote_checkpoints():
-    bucket_name, prefix = parse_gs_uri(
-        AIP_CHECKPOINT_DIR
+def is_ema_checkpoint(name):
+    return "ema" in Path(name).name.lower()
+
+
+def checkpoint_rank(name):
+    return (
+        checkpoint_epoch(name),
+        1 if is_ema_checkpoint(name) else 0,
     )
+
+
+def select_latest_checkpoint(items, name_getter):
+    """
+    Select the latest checkpoint.
+
+    For real_v2 and sim2real, prefer the latest EMA checkpoint whenever
+    at least one EMA checkpoint is available.
+    """
+    if not items:
+        return None
+
+    candidates = items
+
+    if EXPERIMENT in {"real_v2", "sim2real"}:
+        ema_candidates = [
+            item
+            for item in items
+            if is_ema_checkpoint(name_getter(item))
+        ]
+        if ema_candidates:
+            candidates = ema_candidates
+
+    return max(
+        candidates,
+        key=lambda item: checkpoint_rank(name_getter(item)),
+    )
+
+
+def remote_checkpoints():
+    bucket_name, prefix = parse_gs_uri(AIP_CHECKPOINT_DIR)
 
     client = storage.Client()
     bucket = client.bucket(bucket_name)
-
     query_prefix = f"{prefix}/" if prefix else ""
 
     blobs = [
         blob
-        for blob in client.list_blobs(
-            bucket_name,
-            prefix=query_prefix,
-        )
+        for blob in client.list_blobs(bucket_name, prefix=query_prefix)
         if CHECKPOINT_RE.search(Path(blob.name).name)
     ]
 
@@ -490,13 +1055,26 @@ def download_latest_checkpoint():
         )
         return None
 
-    newest = max(
-        blobs,
-        key=lambda blob: checkpoint_epoch(blob.name),
-    )
+    newest = select_latest_checkpoint(blobs, lambda blob: blob.name)
+
+    if newest is None:
+        print(
+            "No usable checkpoint found. Starting a new run.",
+            flush=True,
+        )
+        return None
+
+    if (
+        EXPERIMENT in {"real_v2", "sim2real"}
+        and not is_ema_checkpoint(newest.name)
+    ):
+        print(
+            "WARNING: no EMA checkpoint was found; resuming from the "
+            "latest regular checkpoint.",
+            flush=True,
+        )
 
     RESUME_DIR.mkdir(parents=True, exist_ok=True)
-
     local = RESUME_DIR / Path(newest.name).name
 
     print(
@@ -506,9 +1084,27 @@ def download_latest_checkpoint():
 
     newest.download_to_filename(str(local))
 
+    # TAO EMA resume may require both the regular and EMA files for the same
+    # epoch to be present side by side. Download the matching companion when
+    # it exists in GCS.
+    epoch = checkpoint_epoch(newest.name)
+    blob_by_name = {Path(blob.name).name: blob for blob in blobs}
+
+    if is_ema_checkpoint(newest.name):
+        companion_name = f"model_epoch_{epoch:03d}.pth"
+    else:
+        companion_name = f"model_epoch_{epoch:03d}-EMA.pth"
+
+    companion = blob_by_name.get(companion_name)
+    if companion is not None:
+        companion_local = RESUME_DIR / companion_name
+        companion.download_to_filename(str(companion_local))
+        print(f"companion       : {companion_local}", flush=True)
+
     print(f"downloaded to    : {local}", flush=True)
     print(
-        f"resuming from epoch {checkpoint_epoch(newest.name)}",
+        f"resuming from epoch {epoch}"
+        + (" [EMA]" if is_ema_checkpoint(newest.name) else ""),
         flush=True,
     )
 
@@ -527,18 +1123,12 @@ def local_checkpoints():
 
 
 def upload_checkpoint(path):
-    bucket_name, prefix = parse_gs_uri(
-        AIP_CHECKPOINT_DIR
-    )
+    bucket_name, prefix = parse_gs_uri(AIP_CHECKPOINT_DIR)
 
     client = storage.Client()
     bucket = client.bucket(bucket_name)
 
-    object_name = (
-        f"{prefix}/{path.name}"
-        if prefix
-        else path.name
-    )
+    object_name = f"{prefix}/{path.name}" if prefix else path.name
 
     blob = bucket.blob(object_name)
     blob.upload_from_filename(str(path))
@@ -551,7 +1141,12 @@ def upload_checkpoint(path):
 
 
 def checkpoint_watcher(stop_event):
+    """
+    Upload every stable TAO checkpoint to GCS.
 
+    All interval checkpoints are retained because the best-validation
+    checkpoint may occur before the final epoch.
+    """
     banner("CHECKPOINT WATCHER")
 
     uploaded = set()
@@ -561,11 +1156,7 @@ def checkpoint_watcher(stop_event):
         for checkpoint in local_checkpoints():
             key = str(checkpoint)
             stat = checkpoint.stat()
-
-            current_state = (
-                stat.st_size,
-                stat.st_mtime_ns,
-            )
+            current_state = (stat.st_size, stat.st_mtime_ns)
 
             if key in uploaded:
                 continue
@@ -578,9 +1169,9 @@ def checkpoint_watcher(stop_event):
 
         stop_event.wait(SYNC_INTERVAL_SECONDS)
 
+    # Final best effort after TAO exits normally.
     for checkpoint in local_checkpoints():
         key = str(checkpoint)
-
         if key not in uploaded:
             upload_checkpoint(checkpoint)
             uploaded.add(key)
@@ -595,19 +1186,25 @@ def build_train_command(resume_checkpoint):
         f"results_dir={RESULTS_DIR}",
     ]
 
-    if EXPERIMENT in {"sim2real", "real"}:
+    if EXPERIMENT in {"sim2real", "real", "real_v2"}:
         command.append(
             "dataset.train_data_sources.0.json_file="
             f"{TRAIN_JSON}"
         )
 
-    if (
-        EXPERIMENT == "sim2real"
-        and resume_checkpoint is None
-    ):
+    # B-seq: initialize a fresh sim2real run from the selected A checkpoint.
+    if EXPERIMENT == "sim2real" and resume_checkpoint is None:
         command.append(
             "train.pretrained_model_path="
             f"{PRETRAINED_MODEL_LOCAL}"
+        )
+
+    # C-v2: initialize a fresh run from the full NVIDIA RT-DETR checkpoint
+    # embedded in the container. On resume, use only the TAO resume checkpoint.
+    if EXPERIMENT == "real_v2" and resume_checkpoint is None:
+        command.append(
+            "train.pretrained_model_path="
+            f"{RTDETR_PRETRAINED_LOCAL}"
         )
 
     if SMOKE_TEST:
@@ -645,7 +1242,6 @@ def run_training(resume_checkpoint):
         args=(stop_event,),
         daemon=True,
     )
-
     watcher.start()
 
     process = subprocess.Popen(command)
@@ -659,14 +1255,11 @@ def run_training(resume_checkpoint):
             f"TAO training failed with exit code {return_code}"
         )
 
-    print(
-        "TAO training completed successfully.",
-        flush=True,
-    )
+    print("TAO training completed successfully.", flush=True)
 
 
 def build_evaluate_command():
-    return [
+    command = [
         "rtdetr",
         "evaluate",
         "-e",
@@ -674,6 +1267,14 @@ def build_evaluate_command():
         f"results_dir={RESULTS_DIR}",
         f"evaluate.checkpoint={EVALUATION_CHECKPOINT_LOCAL}",
     ]
+
+    if EXPERIMENT in {"sim2real", "real", "real_v2"}:
+        command.append(
+            "dataset.train_data_sources.0.json_file="
+            f"{TRAIN_JSON}"
+        )
+
+    return command
 
 
 def run_evaluation():
@@ -695,10 +1296,7 @@ def run_evaluation():
             f"TAO evaluation failed with exit code {return_code}"
         )
 
-    print(
-        "TAO evaluation completed successfully.",
-        flush=True,
-    )
+    print("TAO evaluation completed successfully.", flush=True)
 
 
 def latest_local_checkpoint():
@@ -709,38 +1307,44 @@ def latest_local_checkpoint():
             "Training completed but no TAO checkpoint was found."
         )
 
-    return max(
+    checkpoint = select_latest_checkpoint(
         checkpoints,
-        key=lambda path: checkpoint_epoch(path.name),
+        lambda path: path.name,
     )
+
+    if checkpoint is None:
+        raise SystemExit(
+            "Training completed but no usable TAO checkpoint was found."
+        )
+
+    return checkpoint
 
 
 def upload_final_model():
+    """
+    Upload the latest checkpoint as the final run artifact.
 
+    This is not necessarily the best-validation checkpoint. All interval
+    checkpoints remain available in AIP_CHECKPOINT_DIR for later selection.
+
+    For real_v2 and sim2real, the latest EMA checkpoint is preferred
+    when present.
+    """
     banner("FINAL MODEL")
 
     checkpoint = latest_local_checkpoint()
 
-    bucket_name, prefix = parse_gs_uri(
-        AIP_MODEL_DIR
-    )
+    bucket_name, prefix = parse_gs_uri(AIP_MODEL_DIR)
 
     client = storage.Client()
     bucket = client.bucket(bucket_name)
 
-    object_name = (
-        f"{prefix}/{checkpoint.name}"
-        if prefix
-        else checkpoint.name
-    )
+    object_name = f"{prefix}/{checkpoint.name}" if prefix else checkpoint.name
 
     blob = bucket.blob(object_name)
     blob.upload_from_filename(str(checkpoint))
 
-    print(
-        f"final checkpoint : {checkpoint}",
-        flush=True,
-    )
+    print(f"final checkpoint : {checkpoint}", flush=True)
     print(
         "uploaded model   : "
         f"gs://{bucket_name}/{object_name}",
@@ -765,11 +1369,7 @@ def main():
     require_environment()
     probe_gpu()
 
-    download_gcs_prefix(
-        DATA_URI,
-        DATA_DIR,
-    )
-
+    download_gcs_prefix(DATA_URI, DATA_DIR)
     validate_dataset_layout()
 
     if ACTION == "train":

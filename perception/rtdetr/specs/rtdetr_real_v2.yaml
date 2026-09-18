@@ -1,21 +1,17 @@
-results_dir: /workspace/results/A_synth
+results_dir: /workspace/results/C_real_v2
 
 dataset:
   train_data_sources:
-    - image_dir: /workspace/data/synth/images/train
-      json_file: /workspace/data/synth/annotations/instances_train.json
+    - image_dir: /workspace/data/real_v2/train/images
+      json_file: /workspace/data/real_v2/annotations/real_train_full.json
 
   val_data_sources:
-    image_dir: /workspace/data/synth/images/val
-    json_file: /workspace/data/synth/annotations/instances_val.json
+    image_dir: /workspace/data/real_v2/val/images
+    json_file: /workspace/data/real_v2/annotations/real_val.json
 
   test_data_sources:
-    image_dir: /workspace/data/synth/images/val
-    json_file: /workspace/data/synth/annotations/instances_val.json
-
-  infer_data_sources:
-    image_dir: [/workspace/data/synth/images/val]
-    classmap: /workspace/data/synth/annotations/classmap.txt
+    image_dir: /workspace/data/real_v2/test/images
+    json_file: /workspace/data/real_v2/annotations/real_test.json
 
   num_classes: 3
   eval_class_ids: [1, 2]
@@ -31,7 +27,9 @@ dataset:
     train_spatial_size: [544, 960]
     eval_spatial_size: [544, 960]
 
+    # Explicit instead of relying on TAO defaults.
     multi_scales: [480, 512, 544, 576, 608]
+
     distortion_prob: 0.6
     iou_crop_prob: 0.4
     preserve_aspect_ratio: false
@@ -39,13 +37,16 @@ dataset:
 model:
   backbone: resnet_50
   train_backbone: true
+
   num_queries: 300
   num_select: 300
+
   return_interm_indices: [1, 2, 3]
   dec_layers: 6
   enc_layers: 1
 
 train:
+  # Full RT-DETR initialization, not only ResNet-50.
   pretrained_model_path: /workspace/weights/rtdetr_pretrained.pth
 
   num_epochs: 120
@@ -62,6 +63,7 @@ train:
   activation_checkpoint: true
 
   clip_grad_norm: 0.1
+
   enable_ema: true
 
   optim:
