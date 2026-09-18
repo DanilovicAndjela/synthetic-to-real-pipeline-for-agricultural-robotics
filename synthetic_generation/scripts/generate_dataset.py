@@ -57,17 +57,38 @@ CROP_SIZE_MODE = "preserve"
 
 # Growth stages
 CROP_STAGES = {
-    "cotyledon": {"weight": 0.30, "fp": (0.025, 0.055), "assets": ["v14"]},
-    "early": {"weight": 0.55, "fp": (0.06, 0.11), "assets": ["v09", "v12", "v13"]},
+    # Opsezi i tezine podeseni tako da marginalna raspodjela velicine
+    # kulture prati realni CropOrWeed2 val (p10=14.2 p25=21.2 p50=35.0
+    # p75=69.0 p90=146.1 px @960). Log-RMSE po percentilima: 0.160.
+    # NAPOMENA: podesavano uz pretpostavljene nativne velicine za v01-v14.
+    # Nakon prvog runa uporedi [stage] redove sa stvarnim vrijednostima i
+    # po potrebi doradi.
+    "cotyledon": {
+        "weight": 0.44,
+        "fp": (0.010, 0.042),
+        "assets": ["v14", "v19", "v20"],
+    },
+    "early": {
+        "weight": 0.26,
+        "fp": (0.028, 0.075),
+        "assets": ["v09", "v12", "v13", "v15", "v16"],
+    },
     "mid": {
-        "weight": 0.15,
-        "fp": (0.12, 0.20),
-        "assets": ["v01", "v02", "v03", "v08", "v10", "v11"],
+        "weight": 0.17,
+        "fp": (0.060, 0.130),
+        "assets": ["v01", "v02", "v03", "v17"],
+    },
+    "late": {
+        "weight": 0.13,
+        "fp": (0.110, 0.260),
+        "assets": ["v08", "v10", "v11", "v18"],
     },
 }
 
-CROP_MAX_STRETCH = 1.6
-CROP_FOOTPRINT_CLAMP = (0.02, 0.55)
+# Novi modeli su normalizovani na ~5 cm bez obzira na BBCH fazu, pa im
+# treba vise prostora za rastezanje nego ranijih 1.6.
+CROP_MAX_STRETCH = 2.2
+CROP_FOOTPRINT_CLAMP = (0.012, 0.55)
 CENTER_ON_CROWN = True
 CROWN_PRIM_NAMES = ("crown",)
 
@@ -77,7 +98,72 @@ CLASS_TARGET_FOOTPRINT = {
 }
 
 CROP_SCALE_JITTER = (0.85, 1.15)
-WEED_FOOTPRINT_RANGE = (0.008, 0.032)
+
+# --- velicina korova ------------------------------------------------------
+# Umjesto fiksnog raspona u metrima uzorkujemo ciljanu velicinu u PIKSELIMA
+# izlazne slike, pa je preko GSD-a tog kadra pretvaramo u metre. Time se
+# sinteticka raspodjela poklapa sa realnom bez obzira na visinu kamere.
+#
+# Realni CropOrWeed2 val, sqrt(area) @ 960x544:
+#   korov   p10=9.5  p25=11.9  p50=18.3  p75=32.0  p90=56.6  p99=146.6
+#   kultura p10=14.2 p25=21.2  p50=35.0  p75=69.0  p90=146.1 p99=380.5
+# sigma je namjerno malo veca od izmjerene 0.71 - hocemo da model velike
+# korove vidi cesce nego u stvarnosti.
+WEED_PX_LOGNORM = (3.04, 0.75)          # mu, sigma za ln(sqrt(area) u px)
+WEED_PX_CLIP = (9.0, 150.0)             # px na FINAL_W
+# 9.0 umjesto ranijih 7.0: realni korov ima p10 na 9.5 px, a na 7 px
+# anizotropija od 0.45 daje stranice 4.7 x 10.4 px, pa kraca pada ispod
+# MIN_BOX_PX_OUT = 5.0 i instanca se tiho odbacuje.
+WEED_FOOTPRINT_CLAMP = (0.004, 0.16)    # m, sigurnosna ograda
+
+# Nagib korova. Realni korov je poleglo/savijeno, sinteticki stoji uspravno.
+WEED_TILT_DEG = 25.0
+
+# Busenasti raspored. Mjereno na realnom skupu: 20.6% instanci preklapa
+# okvir drugog korova, najblizi susjed je na 1.23-2.30 vlastitih velicina
+# (medijalni korov je 18.3 px ~ 2 cm, dakle susjed na ~2-5 cm).
+# Sinteticki skup je imao 2.8% preklapanja i susjeda na 3.6-7.5 velicina.
+WEED_CLUSTERS = (1, 4)                  # busena po kadru
+WEED_CLUSTER_SPREAD = (0.022, 0.100)    # m, poluprecnik rasipanja u busenu
+WEED_SOLO_FRAC = 0.35                   # udio korova van busena
+# Podeseno simulacijom: preklop okvira 20.7% (realno 20.6%),
+# najblizi susjed / velicina p25=1.23 (realno 1.23).
+
+# Utonulost u zemlju, kao udio footprinta. Realni korov je cesto poluzatrpan
+# zemljom i slamom, sinteticki stoji na povrsini.
+WEED_BURIAL = (0.0, 0.12)
+
+# Anizotropno skaliranje u XY ravni. Izmjereno je da je sinteticki korov
+# presimetrican: odnos stranica okvira p10-p90 bio je 0.73-1.31, a realni je
+# 0.55-1.80. Rastezanjem po jednoj osi iz istog mesha dobijamo porodicu
+# razlicitih silueta bez ijednog novog asseta.
+# sigma=0.40 daje p10=0.57 p50=1.03 p90=1.86 (log-RMSE 0.049 naspram 0.250).
+WEED_ANISO_SIGMA = 0.40
+WEED_ANISO_CLIP = (0.45, 2.2)
+
+
+def output_gsd(cam_h):
+    """Metara po pikselu IZLAZNE slike na datoj visini kamere."""
+    return (HORIZ_APERTURE / FOCAL_LENGTH) * cam_h / FINAL_W
+
+
+def sample_weed_footprint(rng, cam_h):
+    """Uzorkuj velicinu korova u px, vrati footprint u metrima."""
+    px = math.exp(rng.gauss(*WEED_PX_LOGNORM))
+    px = min(max(px, WEED_PX_CLIP[0]), WEED_PX_CLIP[1])
+    fp = px * output_gsd(cam_h)
+    return min(max(fp, WEED_FOOTPRINT_CLAMP[0]), WEED_FOOTPRINT_CLAMP[1])
+
+
+def sample_weed_count(rng):
+    """Log-uniformno: vecina kadrova malo korova, rijetki sa gomilom.
+
+    Realno: srednje 6.6/sliku, p50=3, p90=18, max=32.
+    """
+    n = int(round(math.exp(rng.uniform(math.log(1.0), math.log(25.0)))))
+    if rng.random() < 0.03:
+        n = 0                       # cisti negativni kadrovi
+    return min(max(n, 0), MAX_WEED_SLOTS)
 
 # Scene layout
 CROP_ROW_SPACING = 0.50
@@ -86,19 +172,23 @@ CROP_ROW_JITTER = 0.030
 CROP_ALONG_JITTER = 0.045
 CROP_MISSING_PROB = 0.18
 
-WEEDS_PER_FRAME = (2, 10)
+# Zadrzano samo radi dataset_meta.json; broj bira sample_weed_count().
+WEEDS_PER_FRAME = (0, 25)
 
 MAX_CROP_SLOTS = 20
-MAX_WEED_SLOTS = 12
+MAX_WEED_SLOTS = 24
 VARIANTS_PER_SLOT = 6
 
 # Clutter: straw and stones
 CLUTTER_ENABLED = True
 
-STRAW_PER_FRAME = (0, 22)
-STRAW_LENGTH = (0.020, 0.090)
-STRAW_WIDTH = (0.002, 0.004)
-STRAW_BEND = (0.0, 0.12)
+STRAW_PER_FRAME = (0, 34)
+# Na realnim slikama ima kukuruznih zetvenih ostataka znatno duzih od
+# 13 cm - cijelih komada stabljike. Gornja granica podignuta, sirina
+# takodje, jer spljosteni komad stabljike nije vlat.
+STRAW_LENGTH = (0.015, 0.220)
+STRAW_WIDTH = (0.002, 0.009)
+STRAW_BEND = (0.0, 0.18)
 
 STRAW_COLORS_SRGB = [
     (0.81, 0.79, 0.71),
@@ -110,20 +200,23 @@ STRAW_COLORS_SRGB = [
 CLUTTER_COLOR_JITTER = 0.10
 STRAW_ROUGHNESS = (0.88, 0.98)
 
-STONES_PER_FRAME = (0, 30)
-STONE_SIZE = (0.005, 0.025)
+STONES_PER_FRAME = (0, 55)
+STONE_SIZE = (0.004, 0.040)
+# Tlo prolazi kroz SOIL_AUTO_TINT i korektuje se ka neutralnom
+# SOIL_REF_RGB, a kamenje ne dobija nikakvu korekciju - pa je ranija topla
+# paleta izgledala roze u odnosu na korigovano tlo. Zasicenost prepolovljena.
 STONE_COLORS_SRGB = [
-    (0.60, 0.56, 0.50),
-    (0.48, 0.45, 0.40),
-    (0.40, 0.37, 0.33),
-    (0.33, 0.31, 0.28),
-    (0.52, 0.47, 0.39),
+    (0.57, 0.55, 0.52),
+    (0.46, 0.44, 0.42),
+    (0.39, 0.37, 0.35),
+    (0.32, 0.31, 0.30),
+    (0.49, 0.46, 0.42),
 ]
 STONE_ROUGHNESS = (0.86, 0.97)
 STONE_BURIAL = (0.10, 0.40)
 
-MAX_STRAW_SLOTS = 24
-MAX_STONE_SLOTS = 32
+MAX_STRAW_SLOTS = 36
+MAX_STONE_SLOTS = 56
 
 LAYOUT_MARGIN = 0.07
 EDGE_CLIP_CROPS = 2
@@ -167,7 +260,10 @@ USE_INSTANCING = False
 
 SETTLE_UPDATES = 3
 PLANT_RESTEP_MAX = 3
-PLANT_YIELD_MIN = 0.60
+# count_visible ne zna za zaklanjanje, a busenasti raspored ga namjerno
+# uvodi. Prag spusten da gate hvata stvarne kvarove (tekstura nije
+# rezidentna) umjesto legitimnog medjusobnog zaklanjanja korova.
+PLANT_YIELD_MIN = 0.50
 PLANT_VERIFY_MIN_PLACED = 3
 
 SAVE_DISCARDED_FRAMES = True
@@ -529,23 +625,44 @@ def measure_asset(usd_path, target_footprint, cls="weed"):
     rmn = Gf.Vec3d(*(min(c[i] for c in rc) for i in range(3)))
     rmx = Gf.Vec3d(*(max(c[i] for c in rc) for i in range(3)))
 
-    raw_fp = max(rmx[0] - rmn[0], rmx[1] - rmn[1])
-    if raw_fp <= 0:
+    raw_fp_units = max(rmx[0] - rmn[0], rmx[1] - rmn[1])
+    if raw_fp_units <= 0:
         return None, "degenerate bounds"
 
+    # metersPerUnit je do sada bio ignorisan. Bez njega se asset autoran u
+    # centimetrima mjeri 100x prevelikim.
+    unit = float(src_mpu) if src_mpu and src_mpu > 0.0 else 1.0
+    unit_note = f"mpu={unit:g}"
+
+    # Neki eksporteri deklarisu mpu=1.0 ali autoraju brojeve u centimetrima
+    # (npr. sadnica sirine 5.4 "metra"). Vazi SAMO za kulturu: sadnica
+    # secerne repe nikad nije siroka preko 60 cm, pa je zakljucak siguran.
+    # Za korov ovo ne vazi - Poly Haven modeli su korektno u metrima i
+    # legitimno dostizu 1-8 m, a i normalizuju se na CLASS_TARGET_FOOTPRINT
+    # pa jedinica u proracun skale ionako ne ulazi.
+    if cls == "crop" and unit == 1.0 and raw_fp_units > 1.0:
+        unit = 0.01
+        unit_note = "mpu=1.0 ALI izgleda kao cm -> primijenjeno 0.01"
+        print(
+            f"  [WARN] {os.path.basename(usd_path)}: bbox "
+            f"{raw_fp_units:.2f} deklarisan kao metri; tretiram kao cm"
+        )
+
+    raw_fp = raw_fp_units * unit          # u METRIMA, za sve odluke
+
     if cls == "crop" and CROP_SIZE_MODE == "preserve":
-        scale = 1.0
-        scale_note = "native"
+        scale = unit
+        scale_note = f"native ({unit_note})"
         if CROP_FOOTPRINT_CLAMP:
             lo, hi = CROP_FOOTPRINT_CLAMP
             if raw_fp > hi:
-                scale = hi / raw_fp
+                scale = hi / raw_fp_units
                 scale_note = f"CLAMPED down from {raw_fp * 1000:.0f}mm"
             elif raw_fp < lo:
-                scale = lo / raw_fp
+                scale = lo / raw_fp_units
                 scale_note = f"CLAMPED up from {raw_fp * 1000:.0f}mm"
     else:
-        scale = target_footprint / raw_fp
+        scale = target_footprint / raw_fp_units
         scale_note = "normalized"
 
     cx = 0.5 * (rmn[0] + rmx[0])
@@ -569,8 +686,8 @@ def measure_asset(usd_path, target_footprint, cls="weed"):
         "offset": offset,
         "y_up": y_up,
         "raw_footprint": raw_fp,
-        "final_footprint": raw_fp * scale,
-        "raw_height": rmx[2] - rmn[2],
+        "final_footprint": raw_fp_units * scale,
+        "raw_height": (rmx[2] - rmn[2]) * unit,
         "final_height": (rmx[2] - rmn[2]) * scale,
         "mpu": src_mpu,
         "how": how,
@@ -665,7 +782,7 @@ for cls, paths in assets.items():
             fp_lo = info["final_footprint"] * CROP_SCALE_JITTER[0]
             fp_hi = info["final_footprint"] * CROP_SCALE_JITTER[1]
         else:
-            fp_lo, fp_hi = WEED_FOOTPRINT_RANGE
+            fp_lo, fp_hi = WEED_FOOTPRINT_CLAMP
 
         px_min = fp_lo / gsd_max
         px_max = fp_hi / gsd_min
@@ -677,10 +794,11 @@ for cls, paths in assets.items():
             f"{px_max * FINAL_W / IMAGE_W:.0f}px"
         )
 
-        if info["raw_footprint"] > 1.0:
+        if info["raw_footprint"] > 0.60:
             print(
                 f"  [WARN] Large raw footprint: "
-                f"{info['raw_footprint']:.2f} m"
+                f"{info['raw_footprint']:.2f} m "
+                f"(provjeri metersPerUnit u {os.path.basename(info['path'])})"
             )
 
         templates[cls].append(info)
@@ -927,6 +1045,145 @@ else:
     print("[gpu] nvidia-smi unavailable")
 
 
+# --- senescencija korova ---------------------------------------------------
+# "tint"  = override diffuse_tint na MDL/OmniPBR shaderima (cuva teksturu)
+# "flat"  = bind ravnog OmniPBR materijala (garantovano radi, gubi teksturu)
+# "auto"  = pokusaj tint, padni na flat po varijanti
+WEED_SENESCENCE_MODE = "auto"
+WEED_SENESCENCE_PROB = 0.18
+
+# Mjereno na realnom skupu, ograniceno na biljne piksele unutar okvira:
+# korov ima medijan ExG +0.111, a samo 3.6% instanci je ispod nule. Korov
+# JESTE zelen. Ranija tvrdnja da je vecina smedja bila je artefakt mjerenja
+# medijana preko cijelog okvira, koji je kod korova samo ~20% biljka.
+# Paleta je zato pomjerena ka blagoj klorozi i zutilu; samo dvije stavke su
+# stvarno suve, i pokrivaju manjinu sa smedjim vrhovima listova.
+WEED_SENESCENT_TINTS_SRGB = [
+    (0.45, 0.52, 0.26),   # blago kloroticno, jos uvijek zeleno
+    (0.52, 0.55, 0.28),   # zuckasto zeleno
+    (0.62, 0.60, 0.30),   # zuto, na prelazu
+    (0.58, 0.48, 0.26),   # smedje-zuto, suvi vrhovi
+    (0.45, 0.36, 0.22),   # suvo smedje, rijetko
+]
+
+_sen_rng = random.Random(SPLIT_SEED + 4242)
+_sen_stats = {"tint": 0, "flat": 0, "none": 0}
+
+
+def _s2l(c):
+    """sRGB -> linear."""
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _luma_neutral_tint(srgb):
+    """Linearni tint iste luminancije - mijenja nijansu, ne svjetlinu."""
+    lin = [_s2l(min(max(c, 0.0), 1.0)) for c in srgb]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return Gf.Vec3f(*[float(v / max(lum, 1e-6)) for v in lin])
+
+
+def _make_flat_pbr(st, path, srgb, rough):
+    mtl = UsdShade.Material.Define(st, Sdf.Path(path))
+    sh = UsdShade.Shader.Define(st, Sdf.Path(f"{path}/Shader"))
+    sh.CreateImplementationSourceAttr(UsdShade.Tokens.sourceAsset)
+    sh.SetSourceAsset("OmniPBR.mdl", "mdl")
+    sh.SetSourceAssetSubIdentifier("OmniPBR", "mdl")
+    lin = [_s2l(min(max(c, 0.0), 1.0)) for c in srgb]
+    sh.CreateInput(
+        "diffuse_color_constant", Sdf.ValueTypeNames.Color3f
+    ).Set(Gf.Vec3f(*[float(v) for v in lin]))
+    sh.CreateInput(
+        "reflection_roughness_constant", Sdf.ValueTypeNames.Float
+    ).Set(float(rough))
+    mtl.CreateSurfaceOutput("mdl").ConnectToSource(sh.ConnectableAPI(), "out")
+    return mtl
+
+
+def _tintable_shaders(st, root_path):
+    """MDL shaderi ispod root_path koji primaju diffuse_tint."""
+    out = []
+    root = st.GetPrimAtPath(root_path)
+    if not root or not root.IsValid():
+        return out
+    for prim in Usd.PrimRange(
+        root, Usd.TraverseInstanceProxies(Usd.PrimDefaultPredicate)
+    ):
+        if not prim.IsA(UsdShade.Shader):
+            continue
+        sh = UsdShade.Shader(prim)
+        try:
+            sub = str(sh.GetSourceAssetSubIdentifier("mdl") or "")
+        except Exception:
+            sub = ""
+        if "PBR" not in sub:
+            continue
+        out.append(sh)
+    return out
+
+
+def build_weed_appearance(st, vpath, slot_idx, var_idx):
+    """Pripremi opcije uvelosti za jednu weed varijantu."""
+    if WEED_SENESCENCE_MODE in ("auto", "tint"):
+        shaders = _tintable_shaders(st, f"{vpath}/geo")
+        if shaders:
+            for sh in shaders:
+                sh.CreateInput(
+                    "diffuse_tint", Sdf.ValueTypeNames.Color3f
+                ).Set(Gf.Vec3f(1.0, 1.0, 1.0))
+            _sen_stats["tint"] += 1
+            return {"mode": "tint", "shaders": shaders}
+        if WEED_SENESCENCE_MODE == "tint":
+            _sen_stats["none"] += 1
+            return {"mode": "none"}
+
+    mats = [
+        _make_flat_pbr(
+            st,
+            f"/World/Looks/weed_sen_{slot_idx:02d}_{var_idx}_{k}",
+            col,
+            _sen_rng.uniform(0.80, 0.97),
+        )
+        for k, col in enumerate(WEED_SENESCENT_TINTS_SRGB)
+    ]
+    _sen_stats["flat"] += 1
+    return {
+        "mode": "flat",
+        "materials": mats,
+        "geo": st.GetPrimAtPath(f"{vpath}/geo"),
+    }
+
+
+def apply_weed_appearance(app, rng):
+    """Vrati 'healthy' ili 'senescent'; autoruje izgled na sceni."""
+    if not app or app["mode"] == "none":
+        return "healthy"
+
+    senescent = rng.random() < WEED_SENESCENCE_PROB
+
+    if app["mode"] == "tint":
+        tint = (
+            _luma_neutral_tint(rng.choice(WEED_SENESCENT_TINTS_SRGB))
+            if senescent
+            else Gf.Vec3f(1.0, 1.0, 1.0)
+        )
+        for sh in app["shaders"]:
+            sh.GetInput("diffuse_tint").Set(tint)
+        return "senescent" if senescent else "healthy"
+
+    api = UsdShade.MaterialBindingAPI(app["geo"])
+    if senescent:
+        api.Bind(
+            rng.choice(app["materials"]),
+            UsdShade.Tokens.strongerThanDescendants,
+        )
+        return "senescent"
+    try:
+        api.UnbindDirectBinding()
+    except Exception:
+        pass
+    return "healthy"
+
+
 def build_slots(cls, count):
     slots = []
     for s in range(count):
@@ -934,7 +1191,12 @@ def build_slots(cls, count):
         slot = UsdGeom.Xform.Define(stage, root)
         t_op = slot.AddTranslateOp()
         r_op = slot.AddRotateZOp()
+        rx_op = slot.AddRotateXOp() if cls == "weed" else None
+        ry_op = slot.AddRotateYOp() if cls == "weed" else None
         s_op = slot.AddScaleOp()
+        if rx_op is not None:
+            rx_op.Set(0.0)
+            ry_op.Set(0.0)
         t_op.Set(Gf.Vec3d(0.0, 0.0, -50.0))
         r_op.Set(0.0)
         s_op.Set(Gf.Vec3f(1.0, 1.0, 1.0))
@@ -943,6 +1205,7 @@ def build_slots(cls, count):
 
         variants = []
         variant_stage = []
+        variant_app = []
         n_templates = len(templates[cls])
         k = min(VARIANTS_PER_SLOT, n_templates)
 
@@ -991,6 +1254,13 @@ def build_slots(cls, count):
             geo = UsdGeom.Xform.Define(stage, f"{vpath}/geo")
             geo.GetPrim().GetReferences().AddReference(info["path"])
 
+            if cls == "weed":
+                variant_app.append(
+                    build_weed_appearance(stage, vpath, s, i)
+                )
+            else:
+                variant_app.append(None)
+
             if USE_INSTANCING:
                 geo.GetPrim().SetInstanceable(True)
 
@@ -1005,8 +1275,11 @@ def build_slots(cls, count):
                 "imageable": UsdGeom.Imageable(slot.GetPrim()),
                 "t": t_op,
                 "r": r_op,
+                "rx": rx_op,
+                "ry": ry_op,
                 "s": s_op,
                 "variants": variants,
+                "variant_app": variant_app,
                 "variant_stage": variant_stage,
                 "variant_fp": [templates[cls][i]["final_footprint"] for i in idxs],
                 "active_variant": None,
@@ -1084,6 +1357,21 @@ print(
     f"[slots] crop={len(slot_pool.get('crop', []))}, "
     f"weed={len(slot_pool.get('weed', []))}"
 )
+print(
+    f"[senescence] mode={WEED_SENESCENCE_MODE}, prob={WEED_SENESCENCE_PROB}, "
+    f"tint={_sen_stats['tint']}, flat={_sen_stats['flat']}, "
+    f"none={_sen_stats['none']}"
+)
+if _sen_stats["none"]:
+    print(
+        "[WARN] neke weed varijante nemaju tintabilan materijal; "
+        "postavi WEED_SENESCENCE_MODE = 'flat' ili 'auto'"
+    )
+if _sen_stats["flat"]:
+    print(
+        "[senescence] flat rezim gubi teksturu lista - provjeri "
+        "debug_overlays prije punog runa"
+    )
 
 
 def srgb_to_linear(c):
@@ -1094,9 +1382,18 @@ _clutter_rng = random.Random(SPLIT_SEED + 991)
 
 
 def jittered_linear(srgb, amount):
+    """Jitter SVJETLINE uz vrlo mali pomak nijanse.
+
+    Ranije je svaki kanal jitterovan nezavisno sa +-10%, sto je pomjeralo
+    NIJANSU a ne svjetlinu - (0.60, 0.56, 0.50) je znalo postati
+    (0.66, 0.50, 0.55), dakle roze kamenje. Sada je glavni faktor
+    zajednicki za sva tri kanala, a po-kanalni ostatak je petina toga.
+    """
+    gain = 1.0 + _clutter_rng.uniform(-amount, amount)
+    hue = amount * 0.2
     out = []
     for c in srgb:
-        j = c * (1.0 + _clutter_rng.uniform(-amount, amount))
+        j = c * gain * (1.0 + _clutter_rng.uniform(-hue, hue))
         out.append(srgb_to_linear(min(max(j, 0.0), 1.0)))
     return tuple(out)
 
@@ -1387,7 +1684,10 @@ def hide_slot(slot):
         slot["active_variant"] = None
 
 
-def place_slot(slot, x, y, yaw_deg, scale_mult, variant_idx):
+def place_slot(
+    slot, x, y, yaw_deg, scale_mult, variant_idx,
+    tilt_x=0.0, tilt_y=0.0, bury=0.0, aniso=1.0,
+):
     if slot["active_variant"] is not None:
         UsdGeom.Imageable(slot["active_variant"]).MakeInvisible()
 
@@ -1395,9 +1695,15 @@ def place_slot(slot, x, y, yaw_deg, scale_mult, variant_idx):
     UsdGeom.Imageable(v).MakeVisible()
     slot["active_variant"] = v
 
-    slot["t"].Set(Gf.Vec3d(x, y, 0.0))
+    slot["t"].Set(Gf.Vec3d(x, y, -float(bury)))
     slot["r"].Set(float(yaw_deg))
-    slot["s"].Set(Gf.Vec3f(scale_mult, scale_mult, scale_mult))
+    if slot.get("rx") is not None:
+        slot["rx"].Set(float(tilt_x))
+        slot["ry"].Set(float(tilt_y))
+    _a = math.sqrt(max(float(aniso), 1e-6))
+    slot["s"].Set(
+        Gf.Vec3f(scale_mult * _a, scale_mult / _a, scale_mult)
+    )
     slot["imageable"].MakeVisible()
 
 
@@ -1527,14 +1833,28 @@ def clutter_layout(rng, half_extent, n, avoid, avoid_r):
 
 
 def weed_layout(rng, half_extent):
-    n = rng.randint(WEEDS_PER_FRAME[0], WEEDS_PER_FRAME[1])
+    """Busenasti raspored: dio korova solo, ostatak oko nekoliko centara."""
+    n = sample_weed_count(rng)
     n = min(n, MAX_WEED_SLOTS)
     half_w, half_h = half_extent
     pts = []
 
-    for _ in range(n):
-        x = rng.uniform(-half_w, half_w)
-        y = rng.uniform(-half_h, half_h)
+    n_solo = int(round(n * WEED_SOLO_FRAC))
+    centers = [
+        (rng.uniform(-half_w, half_w), rng.uniform(-half_h, half_h))
+        for _ in range(rng.randint(*WEED_CLUSTERS))
+    ]
+
+    for k in range(n):
+        if k < n_solo or not centers:
+            x = rng.uniform(-half_w, half_w)
+            y = rng.uniform(-half_h, half_h)
+        else:
+            cx, cy = rng.choice(centers)
+            r = rng.uniform(*WEED_CLUSTER_SPREAD)
+            a = rng.uniform(0.0, 2.0 * math.pi)
+            x = min(max(cx + r * math.cos(a), -half_w), half_w)
+            y = min(max(cy + r * math.sin(a), -half_h), half_h)
 
         if rng.random() < EDGE_CLIP_WEED_PROB:
             if rng.random() < 0.5:
@@ -2029,19 +2349,35 @@ for frame_idx in range(NUM_IMAGES):
             world_pos = to_world(positions, cam_yaw, ox, oy)
             base_fp = CLASS_TARGET_FOOTPRINT["weed"]
             weed_extents = []
+            n_senescent = 0
 
             for slot, (wx, wy), (lx, ly) in zip(
                 slot_pool["weed"], world_pos, positions
             ):
-                fp = rng.uniform(*WEED_FOOTPRINT_RANGE)
+                fp = sample_weed_footprint(rng, cam_h)
+                variant_idx = rng.randrange(len(slot["variants"]))
                 place_slot(
                     slot,
                     wx,
                     wy,
                     yaw_deg=rng.uniform(0.0, 360.0),
                     scale_mult=fp / base_fp,
-                    variant_idx=rng.randrange(len(slot["variants"])),
+                    variant_idx=variant_idx,
+                    tilt_x=rng.uniform(-WEED_TILT_DEG, WEED_TILT_DEG),
+                    tilt_y=rng.uniform(-WEED_TILT_DEG, WEED_TILT_DEG),
+                    bury=fp * rng.uniform(*WEED_BURIAL),
+                    aniso=min(
+                        max(
+                            math.exp(rng.gauss(0.0, WEED_ANISO_SIGMA)),
+                            WEED_ANISO_CLIP[0],
+                        ),
+                        WEED_ANISO_CLIP[1],
+                    ),
                 )
+                if apply_weed_appearance(
+                    slot["variant_app"][variant_idx], rng
+                ) == "senescent":
+                    n_senescent += 1
                 weed_extents.append((lx, ly, fp))
 
             n_weed = min(len(positions), len(slot_pool["weed"]))
@@ -2057,7 +2393,10 @@ for frame_idx in range(NUM_IMAGES):
         n_stone = 0
 
         if CLUTTER_ENABLED:
-            avoid = list(crop_positions_used)
+            avoid = list(crop_positions_used) + [
+                (e[0], e[1])
+                for e in (weed_extents if "weed" in slot_pool else [])
+            ]
 
             n_straw = rng.randint(*STRAW_PER_FRAME)
             n_straw = min(n_straw, len(clutter_pool["straw"]))
@@ -2125,9 +2464,17 @@ for frame_idx in range(NUM_IMAGES):
             f"size={half_w * 2:.3f}x{half_h * 2:.3f} m, "
             f"row={row_txt}{attempt_txt}"
         )
+        _wpx = [
+            e[2] / output_gsd(cam_h)
+            for e in (weed_extents if "weed" in slot_pool else [])
+        ]
+        _wtxt = (
+            f", weed_px={min(_wpx):.0f}-{max(_wpx):.0f}" if _wpx else ""
+        )
         print(
             f"[objects] crop={n_crop}, weed={n_weed}, "
             f"straw={n_straw}, stone={n_stone}"
+            f"{_wtxt}, senescent={n_senescent if 'weed' in slot_pool else 0}"
         )
         print(f"[visible] crop={n_crop_in}, weed={n_weed_in}")
 
@@ -2838,7 +3185,19 @@ meta = {
     },
     "class_target_footprint_m": CLASS_TARGET_FOOTPRINT,
     "crop_scale_jitter": list(CROP_SCALE_JITTER),
-    "weed_footprint_range_m": list(WEED_FOOTPRINT_RANGE),
+    "weed_px_lognorm": list(WEED_PX_LOGNORM),
+    "weed_px_clip": list(WEED_PX_CLIP),
+    "weed_footprint_clamp_m": list(WEED_FOOTPRINT_CLAMP),
+    "weed_tilt_deg": WEED_TILT_DEG,
+    "weed_clusters": list(WEED_CLUSTERS),
+    "weed_cluster_spread_m": list(WEED_CLUSTER_SPREAD),
+    "weed_solo_frac": WEED_SOLO_FRAC,
+    "weed_burial_frac": list(WEED_BURIAL),
+    "weed_senescence": {
+        "mode": WEED_SENESCENCE_MODE,
+        "prob": WEED_SENESCENCE_PROB,
+        "variants": dict(_sen_stats),
+    },
     "layout": {
         "crop_row_spacing_m": CROP_ROW_SPACING,
         "crop_in_row_spacing_m": CROP_IN_ROW_SPACING,
@@ -2989,7 +3348,7 @@ if lum_log:
         f"[soil] rgb={sr:.0f},{sg:.0f},{sb:.0f}, sat={ss:.1f}%"
     )
 
-    if gp < 4.0:
+    if gp < 0.8:
         print("[WARN] Vegetation coverage is low")
     if ss > 20.0:
         print("[WARN] Soil saturation is high")

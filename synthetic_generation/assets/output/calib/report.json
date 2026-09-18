@@ -1,0 +1,59 @@
+{
+  "build": {
+    "hostname": "brev-t9fh27gbj",
+    "version_file": "6.0.0-rc.59+release.41464.5f2772bc.gl"
+  },
+  "config": {
+    "image_w": 1920,
+    "image_h": 1920,
+    "final_w": 640,
+    "final_h": 640,
+    "focal_length_mm": 24.0,
+    "horiz_aperture_mm": 20.955
+  },
+  "heights": [
+    {
+      "height_m": 0.6,
+      "error": "insufficient markers",
+      "n_markers_found": 0,
+      "n_markers_expected": 16,
+      "gsd_analytic_render_m_per_px": 0.0002728515625
+    },
+    {
+      "height_m": 0.9,
+      "error": "insufficient markers",
+      "n_markers_found": 0,
+      "n_markers_expected": 16,
+      "gsd_analytic_render_m_per_px": 0.00040927734375
+    },
+    {
+      "height_m": 1.2,
+      "error": "insufficient markers",
+      "n_markers_found": 0,
+      "n_markers_expected": 16,
+      "gsd_analytic_render_m_per_px": 0.000545703125
+    },
+    {
+      "height_m": 1.55,
+      "error": "insufficient markers",
+      "n_markers_found": 0,
+      "n_markers_expected": 16,
+      "gsd_analytic_render_m_per_px": 0.0007048665364583332
+    },
+    {
+      "height_m": 1.8,
+      "error": "insufficient markers",
+      "n_markers_found": 0,
+      "n_markers_expected": 16,
+      "gsd_analytic_render_m_per_px": 0.0008185546875
+    }
+  ],
+  "pass": false,
+  "failures": [
+    "H=0.6: insufficient markers",
+    "H=0.9: insufficient markers",
+    "H=1.2: insufficient markers",
+    "H=1.55: insufficient markers",
+    "H=1.8: insufficient markers"
+  ]
+}
