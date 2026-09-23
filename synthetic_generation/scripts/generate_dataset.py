@@ -122,7 +122,7 @@ def sample_weed_footprint(rng, cam_h):
 def sample_weed_count(rng):
     n = int(round(math.exp(rng.uniform(math.log(1.0), math.log(25.0)))))
     if rng.random() < 0.03:
-        n = 0                       # cisti negativni kadrovi
+        n = 0                   
     return min(max(n, 0), MAX_WEED_SLOTS)
 
 # Scene layout
@@ -132,7 +132,6 @@ CROP_ROW_JITTER = 0.030
 CROP_ALONG_JITTER = 0.045
 CROP_MISSING_PROB = 0.18
 
-# Zadrzano samo radi dataset_meta.json; broj bira sample_weed_count().
 WEEDS_PER_FRAME = (0, 25)
 
 MAX_CROP_SLOTS = 20
@@ -143,9 +142,6 @@ VARIANTS_PER_SLOT = 6
 CLUTTER_ENABLED = True
 
 STRAW_PER_FRAME = (0, 34)
-# Na realnim slikama ima kukuruznih zetvenih ostataka znatno duzih od
-# 13 cm - cijelih komada stabljike. Gornja granica podignuta, sirina
-# takodje, jer spljosteni komad stabljike nije vlat.
 STRAW_LENGTH = (0.015, 0.220)
 STRAW_WIDTH = (0.002, 0.009)
 STRAW_BEND = (0.0, 0.18)
@@ -162,9 +158,6 @@ STRAW_ROUGHNESS = (0.88, 0.98)
 
 STONES_PER_FRAME = (0, 55)
 STONE_SIZE = (0.004, 0.040)
-# Tlo prolazi kroz SOIL_AUTO_TINT i korektuje se ka neutralnom
-# SOIL_REF_RGB, a kamenje ne dobija nikakvu korekciju - pa je ranija topla
-# paleta izgledala roze u odnosu na korigovano tlo. Zasicenost prepolovljena.
 STONE_COLORS_SRGB = [
     (0.57, 0.55, 0.52),
     (0.46, 0.44, 0.42),
@@ -220,9 +213,6 @@ USE_INSTANCING = False
 
 SETTLE_UPDATES = 3
 PLANT_RESTEP_MAX = 3
-# count_visible ne zna za zaklanjanje, a busenasti raspored ga namjerno
-# uvodi. Prag spusten da gate hvata stvarne kvarove (tekstura nije
-# rezidentna) umjesto legitimnog medjusobnog zaklanjanja korova.
 PLANT_YIELD_MIN = 0.50
 PLANT_VERIFY_MIN_PLACED = 3
 
@@ -589,26 +579,14 @@ def measure_asset(usd_path, target_footprint, cls="weed"):
     if raw_fp_units <= 0:
         return None, "degenerate bounds"
 
-    # metersPerUnit je do sada bio ignorisan. Bez njega se asset autoran u
-    # centimetrima mjeri 100x prevelikim.
     unit = float(src_mpu) if src_mpu and src_mpu > 0.0 else 1.0
     unit_note = f"mpu={unit:g}"
 
-    # Neki eksporteri deklarisu mpu=1.0 ali autoraju brojeve u centimetrima
-    # (npr. sadnica sirine 5.4 "metra"). Vazi SAMO za kulturu: sadnica
-    # secerne repe nikad nije siroka preko 60 cm, pa je zakljucak siguran.
-    # Za korov ovo ne vazi - Poly Haven modeli su korektno u metrima i
-    # legitimno dostizu 1-8 m, a i normalizuju se na CLASS_TARGET_FOOTPRINT
-    # pa jedinica u proracun skale ionako ne ulazi.
     if cls == "crop" and unit == 1.0 and raw_fp_units > 1.0:
         unit = 0.01
-        unit_note = "mpu=1.0 ALI izgleda kao cm -> primijenjeno 0.01"
-        print(
-            f"  [WARN] {os.path.basename(usd_path)}: bbox "
-            f"{raw_fp_units:.2f} deklarisan kao metri; tretiram kao cm"
-        )
+        unit_note = "mpu=1.0 but appears to be cm -> applied 0.01"
 
-    raw_fp = raw_fp_units * unit          # u METRIMA, za sve odluke
+    raw_fp = raw_fp_units * unit     
 
     if cls == "crop" and CROP_SIZE_MODE == "preserve":
         scale = unit
@@ -753,13 +731,6 @@ for cls, paths in assets.items():
             f"~{px_min * FINAL_W / IMAGE_W:.0f}-"
             f"{px_max * FINAL_W / IMAGE_W:.0f}px"
         )
-
-        if info["raw_footprint"] > 0.60:
-            print(
-                f"  [WARN] Large raw footprint: "
-                f"{info['raw_footprint']:.2f} m "
-                f"(provjeri metersPerUnit u {os.path.basename(info['path'])})"
-            )
 
         templates[cls].append(info)
 
@@ -1004,26 +975,16 @@ if _gpu0:
 else:
     print("[gpu] nvidia-smi unavailable")
 
-
-# --- senescencija korova ---------------------------------------------------
-# "tint"  = override diffuse_tint na MDL/OmniPBR shaderima (cuva teksturu)
-# "flat"  = bind ravnog OmniPBR materijala (garantovano radi, gubi teksturu)
-# "auto"  = pokusaj tint, padni na flat po varijanti
 WEED_SENESCENCE_MODE = "auto"
 WEED_SENESCENCE_PROB = 0.18
 
-# Mjereno na realnom skupu, ograniceno na biljne piksele unutar okvira:
-# korov ima medijan ExG +0.111, a samo 3.6% instanci je ispod nule. Korov
-# JESTE zelen. Ranija tvrdnja da je vecina smedja bila je artefakt mjerenja
-# medijana preko cijelog okvira, koji je kod korova samo ~20% biljka.
-# Paleta je zato pomjerena ka blagoj klorozi i zutilu; samo dvije stavke su
-# stvarno suve, i pokrivaju manjinu sa smedjim vrhovima listova.
+
 WEED_SENESCENT_TINTS_SRGB = [
-    (0.45, 0.52, 0.26),   # blago kloroticno, jos uvijek zeleno
-    (0.52, 0.55, 0.28),   # zuckasto zeleno
-    (0.62, 0.60, 0.30),   # zuto, na prelazu
-    (0.58, 0.48, 0.26),   # smedje-zuto, suvi vrhovi
-    (0.45, 0.36, 0.22),   # suvo smedje, rijetko
+    (0.45, 0.52, 0.26),
+    (0.52, 0.55, 0.28),
+    (0.62, 0.60, 0.30),
+    (0.58, 0.48, 0.26),
+    (0.45, 0.36, 0.22),
 ]
 
 _sen_rng = random.Random(SPLIT_SEED + 4242)
@@ -1036,7 +997,6 @@ def _s2l(c):
 
 
 def _luma_neutral_tint(srgb):
-    """Linearni tint iste luminancije - mijenja nijansu, ne svjetlinu."""
     lin = [_s2l(min(max(c, 0.0), 1.0)) for c in srgb]
     lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
     return Gf.Vec3f(*[float(v / max(lum, 1e-6)) for v in lin])
@@ -1060,7 +1020,6 @@ def _make_flat_pbr(st, path, srgb, rough):
 
 
 def _tintable_shaders(st, root_path):
-    """MDL shaderi ispod root_path koji primaju diffuse_tint."""
     out = []
     root = st.GetPrimAtPath(root_path)
     if not root or not root.IsValid():
@@ -1082,7 +1041,6 @@ def _tintable_shaders(st, root_path):
 
 
 def build_weed_appearance(st, vpath, slot_idx, var_idx):
-    """Pripremi opcije uvelosti za jednu weed varijantu."""
     if WEED_SENESCENCE_MODE in ("auto", "tint"):
         shaders = _tintable_shaders(st, f"{vpath}/geo")
         if shaders:
@@ -1114,7 +1072,6 @@ def build_weed_appearance(st, vpath, slot_idx, var_idx):
 
 
 def apply_weed_appearance(app, rng):
-    """Vrati 'healthy' ili 'senescent'; autoruje izgled na sceni."""
     if not app or app["mode"] == "none":
         return "healthy"
 
@@ -1322,16 +1279,6 @@ print(
     f"tint={_sen_stats['tint']}, flat={_sen_stats['flat']}, "
     f"none={_sen_stats['none']}"
 )
-if _sen_stats["none"]:
-    print(
-        "[WARN] neke weed varijante nemaju tintabilan materijal; "
-        "postavi WEED_SENESCENCE_MODE = 'flat' ili 'auto'"
-    )
-if _sen_stats["flat"]:
-    print(
-        "[senescence] flat rezim gubi teksturu lista - provjeri "
-        "debug_overlays prije punog runa"
-    )
 
 
 def srgb_to_linear(c):
@@ -1342,13 +1289,6 @@ _clutter_rng = random.Random(SPLIT_SEED + 991)
 
 
 def jittered_linear(srgb, amount):
-    """Jitter SVJETLINE uz vrlo mali pomak nijanse.
-
-    Ranije je svaki kanal jitterovan nezavisno sa +-10%, sto je pomjeralo
-    NIJANSU a ne svjetlinu - (0.60, 0.56, 0.50) je znalo postati
-    (0.66, 0.50, 0.55), dakle roze kamenje. Sada je glavni faktor
-    zajednicki za sva tri kanala, a po-kanalni ostatak je petina toga.
-    """
     gain = 1.0 + _clutter_rng.uniform(-amount, amount)
     hue = amount * 0.2
     out = []
@@ -1793,7 +1733,6 @@ def clutter_layout(rng, half_extent, n, avoid, avoid_r):
 
 
 def weed_layout(rng, half_extent):
-    """Busenasti raspored: dio korova solo, ostatak oko nekoliko centara."""
     n = sample_weed_count(rng)
     n = min(n, MAX_WEED_SLOTS)
     half_w, half_h = half_extent
