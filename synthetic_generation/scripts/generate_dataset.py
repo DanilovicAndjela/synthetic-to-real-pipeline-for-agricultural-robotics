@@ -57,12 +57,6 @@ CROP_SIZE_MODE = "preserve"
 
 # Growth stages
 CROP_STAGES = {
-    # Opsezi i tezine podeseni tako da marginalna raspodjela velicine
-    # kulture prati realni CropOrWeed2 val (p10=14.2 p25=21.2 p50=35.0
-    # p75=69.0 p90=146.1 px @960). Log-RMSE po percentilima: 0.160.
-    # NAPOMENA: podesavano uz pretpostavljene nativne velicine za v01-v14.
-    # Nakon prvog runa uporedi [stage] redove sa stvarnim vrijednostima i
-    # po potrebi doradi.
     "cotyledon": {
         "weight": 0.44,
         "fp": (0.010, 0.042),
@@ -85,8 +79,6 @@ CROP_STAGES = {
     },
 }
 
-# Novi modeli su normalizovani na ~5 cm bez obzira na BBCH fazu, pa im
-# treba vise prostora za rastezanje nego ranijih 1.6.
 CROP_MAX_STRETCH = 2.2
 CROP_FOOTPRINT_CLAMP = (0.012, 0.55)
 CENTER_ON_CROWN = True
@@ -99,56 +91,28 @@ CLASS_TARGET_FOOTPRINT = {
 
 CROP_SCALE_JITTER = (0.85, 1.15)
 
-# --- velicina korova ------------------------------------------------------
-# Umjesto fiksnog raspona u metrima uzorkujemo ciljanu velicinu u PIKSELIMA
-# izlazne slike, pa je preko GSD-a tog kadra pretvaramo u metre. Time se
-# sinteticka raspodjela poklapa sa realnom bez obzira na visinu kamere.
-#
-# Realni CropOrWeed2 val, sqrt(area) @ 960x544:
-#   korov   p10=9.5  p25=11.9  p50=18.3  p75=32.0  p90=56.6  p99=146.6
-#   kultura p10=14.2 p25=21.2  p50=35.0  p75=69.0  p90=146.1 p99=380.5
-# sigma je namjerno malo veca od izmjerene 0.71 - hocemo da model velike
-# korove vidi cesce nego u stvarnosti.
-WEED_PX_LOGNORM = (3.04, 0.75)          # mu, sigma za ln(sqrt(area) u px)
-WEED_PX_CLIP = (9.0, 150.0)             # px na FINAL_W
-# 9.0 umjesto ranijih 7.0: realni korov ima p10 na 9.5 px, a na 7 px
-# anizotropija od 0.45 daje stranice 4.7 x 10.4 px, pa kraca pada ispod
-# MIN_BOX_PX_OUT = 5.0 i instanca se tiho odbacuje.
-WEED_FOOTPRINT_CLAMP = (0.004, 0.16)    # m, sigurnosna ograda
 
-# Nagib korova. Realni korov je poleglo/savijeno, sinteticki stoji uspravno.
+WEED_PX_LOGNORM = (3.04, 0.75)       
+WEED_PX_CLIP = (9.0, 150.0)             
+WEED_FOOTPRINT_CLAMP = (0.004, 0.16)    
+
 WEED_TILT_DEG = 25.0
 
-# Busenasti raspored. Mjereno na realnom skupu: 20.6% instanci preklapa
-# okvir drugog korova, najblizi susjed je na 1.23-2.30 vlastitih velicina
-# (medijalni korov je 18.3 px ~ 2 cm, dakle susjed na ~2-5 cm).
-# Sinteticki skup je imao 2.8% preklapanja i susjeda na 3.6-7.5 velicina.
-WEED_CLUSTERS = (1, 4)                  # busena po kadru
-WEED_CLUSTER_SPREAD = (0.022, 0.100)    # m, poluprecnik rasipanja u busenu
-WEED_SOLO_FRAC = 0.35                   # udio korova van busena
-# Podeseno simulacijom: preklop okvira 20.7% (realno 20.6%),
-# najblizi susjed / velicina p25=1.23 (realno 1.23).
+WEED_CLUSTERS = (1, 4)                  
+WEED_CLUSTER_SPREAD = (0.022, 0.100)  
+WEED_SOLO_FRAC = 0.35                  
 
-# Utonulost u zemlju, kao udio footprinta. Realni korov je cesto poluzatrpan
-# zemljom i slamom, sinteticki stoji na povrsini.
 WEED_BURIAL = (0.0, 0.12)
 
-# Anizotropno skaliranje u XY ravni. Izmjereno je da je sinteticki korov
-# presimetrican: odnos stranica okvira p10-p90 bio je 0.73-1.31, a realni je
-# 0.55-1.80. Rastezanjem po jednoj osi iz istog mesha dobijamo porodicu
-# razlicitih silueta bez ijednog novog asseta.
-# sigma=0.40 daje p10=0.57 p50=1.03 p90=1.86 (log-RMSE 0.049 naspram 0.250).
 WEED_ANISO_SIGMA = 0.40
 WEED_ANISO_CLIP = (0.45, 2.2)
 
 
 def output_gsd(cam_h):
-    """Metara po pikselu IZLAZNE slike na datoj visini kamere."""
     return (HORIZ_APERTURE / FOCAL_LENGTH) * cam_h / FINAL_W
 
 
 def sample_weed_footprint(rng, cam_h):
-    """Uzorkuj velicinu korova u px, vrati footprint u metrima."""
     px = math.exp(rng.gauss(*WEED_PX_LOGNORM))
     px = min(max(px, WEED_PX_CLIP[0]), WEED_PX_CLIP[1])
     fp = px * output_gsd(cam_h)
@@ -156,10 +120,6 @@ def sample_weed_footprint(rng, cam_h):
 
 
 def sample_weed_count(rng):
-    """Log-uniformno: vecina kadrova malo korova, rijetki sa gomilom.
-
-    Realno: srednje 6.6/sliku, p50=3, p90=18, max=32.
-    """
     n = int(round(math.exp(rng.uniform(math.log(1.0), math.log(25.0)))))
     if rng.random() < 0.03:
         n = 0                       # cisti negativni kadrovi

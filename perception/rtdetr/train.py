@@ -1,94 +1,4 @@
 #!/usr/bin/env python3
-"""
-Generic Vertex AI runner for NVIDIA TAO RT-DETR training and evaluation.
-
-Supported experiments:
-    EXPERIMENT=synthetic
-        Train RT-DETR on the synthetic dataset.
-
-    EXPERIMENT=sim2real
-        Fine-tune the synthetic-pretrained detector on N real images from the
-        frozen real_v2 dataset.
-        Requires REAL_N and PRETRAINED_MODEL_URI for training.
-
-        Supported REAL_N values: 50, 100, 200, 512.
-
-        For REAL_N=512:
-            train = real_train_full.json
-            val   = real_val.json
-            test  = real_test.json
-
-        For REAL_N<512:
-            train = real_train_{N}.json
-            val   = real_val.json
-            test  = real_test.json
-
-    EXPERIMENT=real
-        Legacy real-only experiment using the old /workspace/data/real layout.
-        Requires REAL_N.
-
-    EXPERIMENT=real_v2
-        Final real-only C experiment using the frozen real_v2 split.
-
-        Supported REAL_N values: 50, 100, 200, 512.
-        If REAL_N is omitted, 512 is used.
-
-        For REAL_N=512:
-            train = real_train_full.json
-            val   = real_val.json
-            test  = real_test.json
-
-        For REAL_N<512:
-            train = real_train_{N}.json
-            val   = real_val.json
-            test  = real_test.json
-
-        The full NVIDIA pretrained RT-DETR checkpoint must already exist
-        inside the container at:
-            /workspace/weights/rtdetr_pretrained.pth
-
-        PRETRAINED_MODEL_URI is not used for real_v2.
-
-Required environment variables:
-    EXPERIMENT
-        synthetic | sim2real | real | real_v2
-
-    DATA_ROOT_URI
-        Root dataset URI, for example:
-        gs://konsulko-gpu-train-staging/data
-
-    AIP_CHECKPOINT_DIR
-        Required for training. Provided by Vertex AI when
-        baseOutputDirectory is configured.
-
-    AIP_MODEL_DIR
-        Required by this runner for job artifacts.
-
-Additional environment variables:
-    ACTION
-        train | evaluate. Default: train
-
-    REAL_N
-        Required for legacy real and sim2real experiments.
-        Optional for real_v2; defaults to 512.
-        Supported real_v2/sim2real values: 50, 100, 200, 512.
-
-    PRETRAINED_MODEL_URI
-        Required only for sim2real training.
-
-    CHECKPOINT_URI
-        Required for ACTION=evaluate.
-
-    SMOKE_TEST
-        Optional boolean. If true, runs 5 epochs and validates/checkpoints
-        after every epoch.
-
-Expected spec files:
-    /workspace/specs/rtdetr_synthetic.yaml
-    /workspace/specs/rtdetr_sim2real.yaml
-    /workspace/specs/rtdetr_real.yaml
-    /workspace/specs/rtdetr_real_v2.yaml
-"""
 
 import json
 import os
@@ -160,6 +70,17 @@ DATA_ROOT_URI = os.environ.get("DATA_ROOT_URI", "").strip().rstrip("/")
 REAL_N_RAW = os.environ.get("REAL_N", "").strip()
 PRETRAINED_MODEL_URI = os.environ.get("PRETRAINED_MODEL_URI", "").strip()
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "").strip()
+EVAL_CLASS_ID_RAW = os.environ.get("EVAL_CLASS_ID", "").strip()
+
+if EVAL_CLASS_ID_RAW:
+    EVAL_CLASS_ID = int(EVAL_CLASS_ID_RAW)
+
+    if EVAL_CLASS_ID not in {1, 2}:
+        raise SystemExit(
+            f"EVAL_CLASS_ID must be 1 (crop) or 2 (weed), got {EVAL_CLASS_ID}"
+        )
+else:
+    EVAL_CLASS_ID = None
 
 SMOKE_TEST = (
     os.environ.get("SMOKE_TEST", "false").strip().lower()
@@ -236,9 +157,7 @@ def resolve_configuration():
         "evaluation_checkpoint_local": None,
     }
 
-    # ------------------------------------------------------------------
     # Synthetic experiment
-    # ------------------------------------------------------------------
     if EXPERIMENT == "synthetic":
         config.update(
             {
@@ -253,9 +172,7 @@ def resolve_configuration():
         resolve_evaluation_checkpoint(config)
         return config
 
-    # ------------------------------------------------------------------
     # Final real-only C experiment on frozen real_v2 split
-    # ------------------------------------------------------------------
     if EXPERIMENT == "real_v2":
         data_dir = DATA_ROOT / "real_v2"
 
@@ -284,9 +201,7 @@ def resolve_configuration():
         resolve_evaluation_checkpoint(config)
         return config
 
-    # ------------------------------------------------------------------
     # B-seq sim2real experiment on the SAME frozen real_v2 split as C
-    # ------------------------------------------------------------------
     if EXPERIMENT == "sim2real":
         if not REAL_N_RAW:
             raise SystemExit(
@@ -333,9 +248,7 @@ def resolve_configuration():
         resolve_evaluation_checkpoint(config)
         return config
 
-    # ------------------------------------------------------------------
     # Legacy real-only path
-    # ------------------------------------------------------------------
     if not REAL_N_RAW:
         raise SystemExit(
             f"REAL_N is required for EXPERIMENT={EXPERIMENT}"
@@ -464,15 +377,15 @@ def require_environment():
 def probe_gpu():
     banner("GPU PROBE")
 
-    print(f"torch          : {torch.__version__}", flush=True)
-    print(f"cuda runtime   : {torch.version.cuda}", flush=True)
-    print(f"cuda available : {torch.cuda.is_available()}", flush=True)
+    print(f"torch: {torch.__version__}", flush=True)
+    print(f"cuda runtime: {torch.version.cuda}", flush=True)
+    print(f"cuda available: {torch.cuda.is_available()}", flush=True)
 
     if not torch.cuda.is_available():
         raise SystemExit("FAIL: no GPU visible to the container")
 
     count = torch.cuda.device_count()
-    print(f"device count   : {count}", flush=True)
+    print(f"device count: {count}", flush=True)
 
     for index in range(count):
         props = torch.cuda.get_device_properties(index)
@@ -505,8 +418,8 @@ def download_gcs_prefix(uri, local_root):
 
     bucket_name, prefix = parse_gs_uri(uri)
 
-    print(f"source : {uri}", flush=True)
-    print(f"target : {local_root}", flush=True)
+    print(f"source: {uri}", flush=True)
+    print(f"target: {local_root}", flush=True)
 
     client = storage.Client()
     query_prefix = f"{prefix}/" if prefix else ""
@@ -557,8 +470,8 @@ def download_gcs_file(uri, local_path):
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"source : {uri}", flush=True)
-    print(f"target : {local_path}", flush=True)
+    print(f"source: {uri}", flush=True)
+    print(f"target: {local_path}", flush=True)
 
     blob.download_to_filename(str(local_path))
 
@@ -740,13 +653,6 @@ def validate_real_v2_dataset():
 
 
 def validate_real_v2_subset():
-    """
-    Validate a reduced real_v2 training subset (REAL_N < 512).
-
-    Used by both sim2real (B) and real_v2 (C). Val/test remain the frozen
-    real_v2 splits. The image directory is still the full train/images
-    directory, so all subset references must exist on disk.
-    """
     required = [
         DATA_DIR / "train/images",
         DATA_DIR / "val/images",
@@ -943,12 +849,6 @@ def validate_dataset_layout():
 
 
 def prepare_pretrained_model():
-    """
-    Only sim2real downloads a task-specific pretrained checkpoint at runtime.
-
-    real_v2 uses the generic full RT-DETR checkpoint embedded in the
-    container image at RTDETR_PRETRAINED_LOCAL.
-    """
     if not (ACTION == "train" and EXPERIMENT == "sim2real"):
         return
 
@@ -1001,12 +901,6 @@ def checkpoint_rank(name):
 
 
 def select_latest_checkpoint(items, name_getter):
-    """
-    Select the latest checkpoint.
-
-    For real_v2 and sim2real, prefer the latest EMA checkpoint whenever
-    at least one EMA checkpoint is available.
-    """
     if not items:
         return None
 
@@ -1084,9 +978,6 @@ def download_latest_checkpoint():
 
     newest.download_to_filename(str(local))
 
-    # TAO EMA resume may require both the regular and EMA files for the same
-    # epoch to be present side by side. Download the matching companion when
-    # it exists in GCS.
     epoch = checkpoint_epoch(newest.name)
     blob_by_name = {Path(blob.name).name: blob for blob in blobs}
 
@@ -1141,12 +1032,6 @@ def upload_checkpoint(path):
 
 
 def checkpoint_watcher(stop_event):
-    """
-    Upload every stable TAO checkpoint to GCS.
-
-    All interval checkpoints are retained because the best-validation
-    checkpoint may occur before the final epoch.
-    """
     banner("CHECKPOINT WATCHER")
 
     uploaded = set()
@@ -1200,7 +1085,7 @@ def build_train_command(resume_checkpoint):
         )
 
     # C-v2: initialize a fresh run from the full NVIDIA RT-DETR checkpoint
-    # embedded in the container. On resume, use only the TAO resume checkpoint.
+    # embedded in the container
     if EXPERIMENT == "real_v2" and resume_checkpoint is None:
         command.append(
             "train.pretrained_model_path="
@@ -1274,6 +1159,11 @@ def build_evaluate_command():
             f"{TRAIN_JSON}"
         )
 
+    if EVAL_CLASS_ID is not None:
+        command.append(
+            f"dataset.eval_class_ids=[{EVAL_CLASS_ID}]"
+        )
+
     return command
 
 
@@ -1321,15 +1211,6 @@ def latest_local_checkpoint():
 
 
 def upload_final_model():
-    """
-    Upload the latest checkpoint as the final run artifact.
-
-    This is not necessarily the best-validation checkpoint. All interval
-    checkpoints remain available in AIP_CHECKPOINT_DIR for later selection.
-
-    For real_v2 and sim2real, the latest EMA checkpoint is preferred
-    when present.
-    """
     banner("FINAL MODEL")
 
     checkpoint = latest_local_checkpoint()

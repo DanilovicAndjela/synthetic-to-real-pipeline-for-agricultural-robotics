@@ -26,3 +26,7 @@ Thumbs.db
 *.tar
 *.tar.gz
 *.zip
+
+# Large Jetson artifacts
+jetson_test/models/*.onnx
+jetson_test/input/*.mp4

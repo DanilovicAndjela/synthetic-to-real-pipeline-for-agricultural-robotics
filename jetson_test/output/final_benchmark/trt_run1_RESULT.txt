@@ -1,0 +1,12 @@
+TensorRT final benchmark - Run 1
+
+Throughput: 39.7642 FPS
+Mean latency: 25.5796 ms
+Median latency: 25.5781 ms
+P95 latency: 25.6328 ms
+Mean GPU compute: 25.1453 ms
+P95 GPU compute: 25.1875 ms
+CPU mean: 1.01 %
+GPU mean: 47.76 %
+RAM mean: 1014.81 MB
+Duration: 600.088 s
